@@ -4,7 +4,8 @@ const { spawn } = require("node:child_process");
 const { readFileSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { createInterface } = require("node:readline");
-const { createReplyReader, listThreads, readThread, readThreadCwd } = require("./codex-history.cjs");
+const { createDiagnostics } = require("./cli-diagnostics.cjs");
+const { createReplyReader, listThreads, readThread, readThreadCwd, queueMessage } = require("./codex-history.cjs");
 
 const retryableLaunchErrors = new Set([
   "ENOENT",
@@ -78,61 +79,6 @@ function launchFailure(child, error) {
   return { state: "uncertain", reason: "cli_outcome_unknown" };
 }
 
-function queueInCodex(execute, codexPath, threadId, prompt, options) {
-  return new Promise((resolve) => {
-    let child,
-      launchError,
-      queueId,
-      warning = false;
-    try {
-      child = execute(
-        codexPath,
-        ["queue", "--thread", threadId, "--message", prompt, "--resume"],
-        options,
-      );
-    } catch (error) {
-      return resolve(launchFailure(child, error));
-    }
-    child.on("error", (error) => {
-      launchError = error;
-    });
-    child.stdin.on("error", () => {});
-    child.stdin.end();
-    for (const stream of [child.stderr, child.stdout]) {
-      createInterface({ input: stream, crlfDelay: Infinity }).on(
-        "line",
-        (line) => {
-          const receipt = /^Queued message (\S+) for thread (\S+)\.?$/i.exec(
-            line.trim(),
-          );
-          if (
-            receipt &&
-            uuid.test(receipt[1]) &&
-            receipt[2].replace(/\.$/, "") === threadId
-          )
-            queueId = receipt[1];
-          if (
-            /\bwarn(?:ing)?\b|(?:could not|unable to|failed to) resume/i.test(
-              line,
-            )
-          )
-            warning = true;
-        },
-      );
-    }
-    child.once("close", (code) => {
-      if (launchError) return resolve(launchFailure(child, launchError));
-      if (code !== 0)
-        return resolve({ state: "uncertain", reason: "queue_outcome_unknown" });
-      resolve({
-        state: "accepted",
-        queueId,
-        ...(warning && { wakeConfirmed: false }),
-      });
-    });
-  });
-}
-
 function externalArgs(workingDir) {
   const args = ["-a", "never",
     "-c", "sandbox_workspace_write.network_access=true",
@@ -152,11 +98,11 @@ function externalArgs(workingDir) {
     "--ignore-user-config", "--ignore-rules", "-C", workingDir];
 }
 
-function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, autoCreated }, outputFile, external) {
+function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, onDiagnostic, replyToken }, outputFile, external, enqueue) {
+  const diagnostics = createDiagnostics("exec", prompt, onDiagnostic);
   const args = external ? externalArgs(workingDir) : ["exec", "-c", "sandbox_workspace_write.network_access=true", "-C", workingDir];
   if (threadId) args.push("resume");
-  args.push("--json");
-  if (!threadId || autoCreated) args.push("--skip-git-repo-check");
+  args.push("--json", "--skip-git-repo-check");
   if (outputFile) args.push("--output-last-message", outputFile);
   if (threadId) args.push(threadId);
   args.push("-");
@@ -182,13 +128,16 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
     try {
       child = execute(codexPath, args, options);
     } catch (error) {
+      diagnostics.report(null, null, error);
       return resolve(launchFailure(child, error));
     }
+    child.stderr.on("data", chunk => diagnostics.capture(chunk.toString("utf8")));
     child.on("error", (error) => {
       launchError = error;
     });
-    child.stdin.on("error", () => {
+    child.stdin.on("error", (error) => {
       inputFailed = true;
+      diagnostics.error(error.message);
     });
     createInterface({ input: child.stderr, crlfDelay: Infinity }).on(
       "line",
@@ -211,6 +160,12 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
         }
         if (!event || typeof event !== "object") return;
         sawEvent = true;
+        if (event.type === "error" || event.type === "turn.failed") {
+          diagnostics.error(event.error?.message || event.message || event.error);
+        }
+        if (event.type === "item.completed" && event.item?.type === "error") {
+          diagnostics.error(event.item.message);
+        }
         if (event.type === "thread.started") {
           if (!threadId && uuid.test(event.thread_id)) {
             threadId = event.thread_id;
@@ -243,11 +198,12 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
         if (event.type === "turn.failed") failed = true;
       },
     );
-    child.once("close", (code) => {
+    child.once("close", (code, signal) => {
+      diagnostics.report(code, signal, launchError);
       if (launchError) return resolve(launchFailure(child, launchError));
       if (!external && code === 1 && activeWriter && !sawEvent && !inputFailed) {
         return resolve(
-          queueInCodex(execute, codexPath, threadId, prompt, options),
+          enqueue({ codexPath, workingDir, threadId, prompt, replyToken, execute, onDiagnostic }),
         );
       }
       if (
@@ -280,12 +236,12 @@ function parseThreadId(value) {
   return id.toLowerCase();
 }
 
-function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestDesktopWake }) {
+function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestDesktopWake, enqueue = queueMessage }) {
   if (typeof codexPath !== "string" || !codexPath.trim()) throw new Error("Missing Codex executable");
   async function submitTurn(turn, external) {
     const outputFile = turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
     try {
-      const result = await runTurn(execute, codexPath, turn, outputFile, external);
+      const result = await runTurn(execute, codexPath, turn, outputFile, external, enqueue);
       if (outputFile && result.state === "completed") {
         try { result.text = readFileSync(outputFile, "utf8"); }
         catch { /* A missing final cannot be sent back to the chat. */ }

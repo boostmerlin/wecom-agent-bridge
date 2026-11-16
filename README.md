@@ -7,7 +7,7 @@
 准备好以下环境：
 
 - Windows、macOS 或 Linux，Node.js 24 或以上。
-- 本机可用的 Codex CLI，支持 `exec resume --json` 和 `queue --resume`。如果启动器找不到可执行文件，将 `CODEX_CLI_PATH` 设为它的绝对路径。
+- 本机可用的 Codex CLI，支持 `exec resume --json` 和 app-server 的 `thread/queue/add`。如果启动器找不到可执行文件，将 `CODEX_CLI_PATH` 设为它的绝对路径。
 - 已开启长连接的企业微信智能机器人、该机器人的长连接 Secret，以及已授权的 `wecom-cli`。用 `wecom-cli identity whoami` 核对身份。
 
 在仓库目录运行：
@@ -79,7 +79,13 @@ node start.cjs
 
 ## 消息投递与排查
 
-桥接通过 WebSocket 接收在线推送，按企微消息 ID 去重。文本和语音转写随正文投递，图片、文件和视频保存到本机后将路径交给 Codex。引用和正文分别展示，附件下载失败会在消息中标出。默认回复一至三句话，正文指定回复内容或格式时按正文处理。
+目标聊天被桌面版占用时，桥接通过 app-server 排队，并用显式的 `clientUserMessageId` 匹配最终答复。队列项 ID 和用户消息 ID 分别处理。发送长任务进度通知前会再次检查最终答复，减少任务已完成时仍发送“已投递”通知的情况。
+
+新建和续接 Codex 聊天都使用 `--skip-git-repo-check`，工作目录可以是普通文件夹。每次 CLI 退出会记录 `cli_exited`，包含 `command`、`exitCode`、`signal`，以及可用的错误码和脱敏错误摘要。用 `requestId` 关联同一条消息的投递、CLI 和回发日志。
+
+投递失败或无法确认结果时，桥接会把通知及记录编号发回原企微会话。明确拒绝的任务可在修复后由本人发送 `/retry`；结果未知时先检查目标聊天，避免重复执行。暂时无法启动 CLI 时，会通知消息已保留并自动重试。失败通知沿用持久化回发队列，`/status` 会区分失败通知与任务答复。
+
+桥接通过 WebSocket 接收在线推送，按企微消息 ID 去重。文本和语音转写随正文投递，图片、文件和视频保存到本机后将路径交给 Codex。引用和正文分别展示，附件下载失败会在消息中标出。默认回复简洁，正文要求的代码、命令、文案等内容完整返回，指定回复内容或格式时严格遵循。
 
 | 现象 | 在哪里看、如何处理 |
 | --- | --- |
@@ -95,7 +101,8 @@ node start.cjs
 | `authenticated` | 企微长连接已认证。 |
 | `delivery_queued` / `delivery_submitted` | 消息已写入本地队列 / 目标聊天已开始处理。 |
 | `delivery_queued_in_codex` / `desktop_wake_requested` | 消息已进入 Codex 桌面队列 / 桥接已请求桌面唤醒聊天。 |
-| `delivery_completed` / `reply_ready` / `reply_sent` | 本轮直接执行已完成 / 最终答复已就绪 / 企微已确认回发。 |
+| `cli_exited` | CLI 已退出，记录退出码、终止信号和脱敏错误摘要。 |
+| `delivery_completed` / `reply_ready` / `reply_sent` | 本轮直接执行已完成 / 回发内容已就绪 / 企微已确认回发。带 `failureReason` 时为失败通知。 |
 | `delivery_uncertain` / `reply_uncertain` | 投递或回发结果未知，桥接停止自动重发。 |
 
 ## 开发与测试

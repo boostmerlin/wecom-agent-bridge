@@ -15,10 +15,10 @@ async function chatTitle(backend, id) {
 function taskSummary(state) {
   if (!state) return '未找到投递记录';
   const delivery = { queued: '本地排队', submitting: state.started ? '正在处理' : '正在投递',
-    queued_in_codex: '已进入后端队列', rejected: '投递被拒绝', uncertain: '投递结果未知', completed: '已完成' };
+    queued_in_codex: '已进入后端队列', rejected: '投递被拒绝', uncertain: '投递结果未知', failed: '处理失败', completed: '已完成' };
   const reply = { registered: '尚无答复', waiting: '等待最终答复', ready: '等待回发', sending: '回发中',
     sent: '已回发', failed: '失败', uncertain: '回发结果未知' };
-  return '投递：' + delivery[state.delivery] + '；回复：' + reply[state.reply];
+  return '投递：' + delivery[state.delivery] + (state.failureReason ? '；失败通知：' : '；回复：') + reply[state.reply];
 }
 
 async function describeStatus(backend, { target, sources, error, last }) {

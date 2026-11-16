@@ -6,7 +6,7 @@ const path = require('node:path');
 const { createInterface } = require('node:readline');
 const { PassThrough } = require('node:stream');
 const test = require('node:test');
-const { createReplyReader, readThreadCwd } = require('../src/backends/codex-history.cjs');
+const { createReplyReader, readThreadCwd, queueMessage } = require('../src/backends/codex-history.cjs');
 
 const { buildWecomPrompt } = require('../src/delivery.cjs');
 
@@ -17,7 +17,7 @@ const marked = n => user('[wecom-request:' + token(n) + ']\n来自聊天的正�
 const answer = text => ({ type: 'agentMessage', phase: 'final_answer', text });
 const turn = (id, items, status = 'completed') => ({ id, status, items, itemsView: 'full' });
 
-function fixture(pages, timeoutMs = 1000, lookup = false) {
+function fixture(pages, timeoutMs = 1000, lookup = false, queueHandler) {
   const methods = [];
   const children = [];
   function execute(command, args, options) {
@@ -40,6 +40,7 @@ function fixture(pages, timeoutMs = 1000, lookup = false) {
       if (method === 'initialized') return;
       let response;
       if (method === 'initialize') response = { result: {} };
+      else if (method === 'thread/queue/add') response = queueHandler(params);
       else if (lookup) {
         assert.equal(method, 'thread/read');
         assert.deepEqual(params, { threadId, includeTurns: false });
@@ -55,10 +56,42 @@ function fixture(pages, timeoutMs = 1000, lookup = false) {
     });
     return child;
   }
-  return { methods, children, cwd: () => readThreadCwd({ threadId, codexPath: 'codex.exe', execute, timeoutMs }),
+  return { methods, children, queue: extra => queueMessage({ threadId, codexPath: 'codex.exe', execute, timeoutMs,
+      workingDir: 'target-project', prompt: 'a queued request', replyToken: token(12), ...extra }),
+    cwd: () => readThreadCwd({ threadId, codexPath: 'codex.exe', execute, timeoutMs }),
     read: createReplyReader({ threadId, codexPath: 'codex.exe',
     workingDir: 'target-project', execute, timeoutMs }) };
 }
+
+test('queue submission uses a persistent client ID distinct from the queue receipt and matches its final', async () => {
+  const pages = new Map([[undefined, { result: { data: [
+    turn('actual-turn', [{ ...user('a queued request'), clientId: token(12) }, answer('correct final')]),
+    turn('unrelated-turn', [{ ...user('a queued request'), clientId: 'other-client' }, answer('unrelated final')]),
+  ], nextCursor: null } }]]);
+  const f = fixture(pages, 1000, false, params => {
+    assert.deepEqual(params, { threadId, clientUserMessageId: token(12), input: [{ type: 'text', text: 'a queued request' }] });
+    return { result: { queuedSubmission: { id: 'different-queue-receipt', clientUserMessageId: params.clientUserMessageId, input: params.input } } };
+  });
+  const submitted = await f.queue();
+  assert.equal(submitted.state, 'accepted');
+  assert.equal(submitted.queueId, 'different-queue-receipt');
+  assert.equal(submitted.replyId, token(12));
+  const result = await f.read(['client:' + submitted.replyId, 'client:' + submitted.queueId]);
+  assert.deepEqual([...result], [['client:' + token(12), 'correct final']]);
+  // A crash before saving the receipt can still recover via the persisted token.
+  assert.equal((await f.read([token(12)])).get(token(12)), 'correct final');
+  assert.ok(f.children.every(child => child.stopped));
+});
+
+test('ambiguous queue outcomes never retry a submission or claim a verified receipt', async () => {
+  for (const response of [undefined, { error: { message: 'disconnected' } },
+    { result: { queuedSubmission: { id: 'queue', clientUserMessageId: 'unexpected-client' } } }]) {
+    const f = fixture(new Map(), 20, false, () => response);
+    assert.deepEqual(await f.queue(), { state: 'uncertain', reason: 'queue_outcome_unknown' });
+    assert.equal(f.methods.filter(method => method === 'thread/queue/add').length, 1);
+    assert.ok(f.children.every(child => child.stopped));
+  }
+});
 
 test('reads every cursor for the target, selects only completed explicit finals and exact bridge headers', async () => {
   const pages = new Map([

@@ -114,8 +114,11 @@ test('desktop reader batches matching tokens, releases failures, and expires onl
   assert.ok(released.some(([id, reason]) => id === 2 && reason === 'ambiguous_turn'));
   assert.ok(released.some(([id, reason]) => id === 3 && reason === 'turn_failed'));
   lateReady = true;
-  await until(() => events.filter(e => e.event === 'reply_sent').length === 2);
-  assert.deepEqual(deliveries, ['A', 'late']);
+  await until(() => events.filter(e => e.event === 'reply_sent').length === 4);
+  assert.equal(deliveries[0], 'A');
+  assert.match(deliveries[1], /任务可能已开始/);
+  assert.match(deliveries[2], /任务失败/);
+  assert.equal(deliveries[3], 'late');
 });
 
 test('a confirmed temporary failure resumes from the unsent part on restart, with persisted backoff', async t => {
@@ -215,15 +218,57 @@ test('upgrade rechecks legacy match failures once, without reopening sent, rejec
   assert.equal(upgraded.hasPendingTurn(), false);
   const waiting = db.prepare("SELECT entry,block_until FROM bridge_replies WHERE state='waiting' ORDER BY entry").all();
   assert.deepEqual(waiting.map(row => [row.entry, row.block_until]), [[1, null], [2, null]]);
-  await until(() => events.some(e => e.entry === 1 && e.event === 'reply_sent'));
+  await until(() => events.some(e => e.entry === 2 && e.event === 'reply_sent'));
   await upgraded.close();
   const restarted = open(opts);
   await delay(40);
   await restarted.close();
   assert.deepEqual(reads, [tokens.slice(0, 2)]);
-  assert.deepEqual(sent, [{ route: group, text: 'verified fixture final' }]);
+  assert.deepEqual(sent[0], { route: group, text: 'verified fixture final' });
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[1].route, group);
+  assert.match(sent[1].text, /任务失败/);
   const states = db.prepare('SELECT state FROM bridge_replies ORDER BY entry').all().map(row => row.state);
-  assert.deepEqual(states, ['sent', 'failed', 'failed', 'sent', 'uncertain', 'uncertain', 'failed', 'registered']);
+  assert.deepEqual(states, ['sent', 'sent', 'failed', 'sent', 'uncertain', 'uncertain', 'failed', 'registered']);
+});
+
+test('failure notices survive restart and cannot be staged or sent twice', async t => {
+  const { open, add, events, db } = fixture(t);
+  const sent = [];
+  const options = { sendReply: async (route, text) => sent.push({ route, text }) };
+  const first = open(options);
+  const token = add(first, 1, group);
+  assert.equal(first.unmatched(1), true);
+  assert.equal(first.unmatched(1), false);
+  await first.close();
+  assert.equal(sent.length, 0);
+  const second = open(options);
+  await until(() => events.some(e => e.entry === 1 && e.event === 'reply_sent'));
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].route, group);
+  assert.ok(sent[0].text.includes(token));
+  assert.equal(second.ready(1, 'unrelated final'), false);
+  assert.equal(db.prepare('SELECT failure_reason FROM bridge_replies WHERE entry=1').get().failure_reason, 'missing_backend_receipt');
+  await second.close();
+  const third = open(options);
+  await delay(20);
+  await third.close();
+  assert.equal(sent.length, 1);
+});
+
+test('progress deadline checks for a final even when history polling is backed off', async t => {
+  const { open, add, events } = fixture(t);
+  const sent = [];
+  let token, reads = 0;
+  const ctrl = open({ pollMs: 1000, maxPollMs: 2000, progressAfterMs: 20,
+    readReplies: async () => ++reads === 1 ? new Map() : new Map([[token, 'finished already']]),
+    sendReply: async (_, text) => sent.push(text) });
+  token = add(ctrl, 1, direct);
+  ctrl.trackProgress(1, false);
+  ctrl.start(1);
+  await until(() => events.some(e => e.event === 'reply_sent'));
+  assert.deepEqual(sent, ['finished already']);
+  assert.equal(events.some(e => e.event === 'progress_sent'), false);
 });
 
 test('long tasks receive a single progress notice across restart, fast tasks only their final', async t => {

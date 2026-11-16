@@ -60,6 +60,12 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
   if (!db.prepare('PRAGMA table_info(bridge_replies)').all().some(column => column.name === 'queue_id')) {
     db.exec('ALTER TABLE bridge_replies ADD COLUMN queue_id TEXT');
   }
+  if (!db.prepare('PRAGMA table_info(bridge_replies)').all().some(column => column.name === 'failure_reason')) {
+    db.exec('ALTER TABLE bridge_replies ADD COLUMN failure_reason TEXT');
+  }
+  if (!db.prepare('PRAGMA table_info(bridge_progress)').all().some(column => column.name === 'deferred')) {
+    db.exec('ALTER TABLE bridge_progress ADD COLUMN deferred INTEGER NOT NULL DEFAULT 0');
+  }
   // Prepare once per literal. This also supports Node 24 releases before createTagStore.
   const statements = new Map();
   const query = method => (strings, ...args) => {
@@ -95,9 +101,12 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
   function bindQueue(entry, id) {
     sql.run`UPDATE bridge_replies SET queue_id=${id} WHERE entry=${entry}`;
   }
-  function unmatched(entry) {
-    sql.run`UPDATE bridge_replies SET state='failed',block_until=NULL WHERE entry=${entry}`;
-    emit('reply_failed', { entry, reason: missingReceiptReason });
+  function unmatched(entry, reason = missingReceiptReason, message) {
+    const description = message || (reason === 'turn_failed'
+      ? '处理程序报告任务失败，任务可能已产生部分改动。请查看目标聊天后决定是否重试。'
+      : '桥接无法确认本次任务的结果，暂未取得可回发的答复。任务可能已开始，请查看目标聊天，避免重复执行。');
+    const token = tokenFor(entry);
+    return ready(entry, description + '\n记录编号：' + token, reason);
   }
   function tokenFor(entry) { return sql.get`SELECT token FROM bridge_replies WHERE entry=${entry}`?.token ?? null; }
   function register(entry, route) {
@@ -128,7 +137,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
   function hasPendingTurn() {
     return !!sql.get`SELECT 1 FROM bridge_replies WHERE state='waiting' AND block_until>${Date.now()} LIMIT 1`;
   }
-  function ready(entry, text) {
+  function ready(entry, text, failureReason = null) {
     if (closed) throw new Error('Reply worker is closed');
     if (typeof text !== 'string' || !text.trim()) return false;
     const row = sql.get`SELECT state FROM bridge_replies WHERE entry=${entry}`;
@@ -140,21 +149,21 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
         sql.run`INSERT INTO bridge_reply_chunks(entry,part,body) VALUES(${entry},${count},${chunk})`;
         count++;
       }
-      sql.run`UPDATE bridge_replies SET state='ready',block_until=NULL,total=${count} WHERE entry=${entry}`;
+      sql.run`UPDATE bridge_replies SET state='ready',block_until=NULL,total=${count},failure_reason=${failureReason} WHERE entry=${entry}`;
       db.exec('RELEASE bridge_stage_reply');
     } catch (error) {
       db.exec('ROLLBACK TO bridge_stage_reply; RELEASE bridge_stage_reply');
       throw error;
     }
-    emit('reply_ready', { entry, parts: count });
-    if (row.state === 'waiting') released(entry, 'ready');
+    emit('reply_ready', { entry, parts: count, ...(failureReason && { failureReason }) });
+    if (row.state === 'waiting') released(entry, failureReason || 'ready');
     wake();
     return true;
   }
-  async function poll() {
+  async function poll(force = false) {
     if (!readReplies) return;
     const waiting = sql.all`SELECT entry,queue_id,token FROM bridge_replies WHERE state='waiting' ORDER BY entry`;
-    if (!waiting.length || nextPoll > Date.now()) return;
+    if (!waiting.length || (!force && nextPoll > Date.now())) return;
     let progress = false;
     try {
       const keys = waiting.map(row => row.queue_id ? replyKey(row.queue_id) : row.token);
@@ -165,11 +174,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
         const token = keys[index];
         const reason = results.unresolved?.get(token);
         if (reason === 'turn_failed' || reason === 'ambiguous_turn') {
-          if (sql.run`UPDATE bridge_replies SET state='failed',block_until=NULL WHERE entry=${entry} AND state='waiting'`.changes) {
-            emit('reply_failed', { entry, reason });
-            released(entry, reason);
-            progress = true;
-          }
+          progress = unmatched(entry, reason) || progress;
         } else if (results.has(token)) {
           progress = ready(entry, results.get(token)) || progress;
         }
@@ -179,11 +184,12 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     nextPoll = Date.now() + pollDelay;
   }
   async function sendNext() {
-    const row = sql.get`SELECT r.entry,r.chat_type,r.chat_id,r.sender_id,r.part,r.total,r.attempts,c.body
+    const row = sql.get`SELECT r.entry,r.chat_type,r.chat_id,r.sender_id,r.part,r.total,r.attempts,r.failure_reason,c.body
       FROM bridge_replies r JOIN bridge_reply_chunks c ON c.entry=r.entry AND c.part=r.part
       WHERE r.state='ready' AND r.retry_at<=${Date.now()} ORDER BY r.entry LIMIT 1`;
     if (!row) return false;
-    const details = { entry: row.entry, part: row.part + 1, parts: row.total };
+    const details = { entry: row.entry, part: row.part + 1, parts: row.total,
+      ...(row.failure_reason && { failureReason: row.failure_reason }) };
     sql.run`UPDATE bridge_replies SET state='sending' WHERE entry=${row.entry}`;
     try {
       await sendReply({ chatType: row.chat_type, chatId: row.chat_id, senderId: row.sender_id }, row.body);
@@ -218,10 +224,10 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     if (state === 'sent') emit('reply_sent', details);
     return true;
   }
-  function trackProgress(entry, started) {
+  function trackProgress(entry, started, deferred = false) {
     try {
       if (!tokenFor(entry)) return;
-      sql.run`INSERT INTO bridge_progress(entry,due,started) VALUES(${entry},${Date.now() + progressAfterMs},${Number(started)})
+      sql.run`INSERT INTO bridge_progress(entry,due,started,deferred) VALUES(${entry},${Date.now() + (deferred ? 0 : progressAfterMs)},${Number(started)},${Number(deferred)})
         ON CONFLICT(entry) DO UPDATE SET started=MAX(started,excluded.started)`;
       wake();
     } catch { emit('progress_failed', { entry, reason: 'progress_storage_error' }); }
@@ -231,13 +237,17 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     catch { emit('progress_failed', { entry, reason: 'progress_storage_error' }); }
   }
   async function sendProgress() {
-    const row = sql.get`SELECT p.entry, r.chat_type, r.chat_id, r.sender_id FROM bridge_progress p
+    const row = sql.get`SELECT p.entry,p.deferred, r.state, r.chat_type, r.chat_id, r.sender_id FROM bridge_progress p
       JOIN bridge_replies r ON r.entry=p.entry WHERE p.due<=${Date.now()}
       AND r.state IN ('registered','waiting') ORDER BY p.due LIMIT 1`;
     if (!row) return;
     const route = { chatType: row.chat_type, chatId: row.chat_id, senderId: row.sender_id };
     try {
-      const text = await progressText(route);
+      // Check before progress notices even when history polling has backed off.
+      if (row.state === 'waiting') await poll(true);
+      const text = row.deferred
+        ? '桥接暂时无法启动处理程序，消息已保留，会自动重试。请勿重复发送。'
+        : await progressText(route);
       // A final may arrive during the title lookup. Reserve before sending so a
       // restart cannot produce a duplicate progress message.
       if (closed || !sql.run`UPDATE bridge_progress SET due=NULL WHERE entry=${row.entry} AND due IS NOT NULL

@@ -9,7 +9,7 @@ const { createReplies } = require("./replies.cjs");
 function buildWecomPrompt(text) {
   return (
     text +
-    "\n\n请先完成正文要求的任务，再用一至三句话总结结果。如正文指定了回复内容或格式，按其要求作答。桥接会将最终答复发回原企微会话，请勿自行发送这条答复。"
+    "\n\n请完成正文要求的任务后回复实际结果。默认简洁，优先说明结论、关键结果和未完成事项。正文要求提供的代码、命令、文案等内容应完整给出；指定了回复内容或格式时，严格遵循。桥接会将最终答复发回原企微会话，请勿自行发送。"
   );
 }
 
@@ -202,6 +202,9 @@ function createDelivery({
             replies?.trackProgress(message.id, true);
             emit("delivery_submitted", { entry: message.id });
           },
+          onDiagnostic(details) {
+            emit("cli_exited", { entry: message.id, ...details });
+          },
         };
         if (owner) result = await backend.submit({
           ...turn, threadId, autoCreated: queueKey !== threadId,
@@ -225,12 +228,14 @@ function createDelivery({
         markResult.run(storedState, storedState, message.id);
         if (
           token &&
-          ["completed", "accepted", "uncertain"].includes(result.state)
+          ["completed", "accepted", "uncertain", "rejected"].includes(result.state)
         ) {
-          if (result.queueId) replies.bindQueue(message.id, result.queueId);
+          if (result.queueId) replies.bindQueue(message.id, result.replyId || result.queueId);
           if (result.state === "completed" && result.text?.trim()) replies.ready(message.id, result.text);
           else if (result.queueId && readReplies) replies.start(message.id);
-          else replies.unmatched(message.id);
+          else if (result.state === "rejected") replies.unmatched(message.id, result.reason || "delivery_rejected",
+            "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
+          else replies.unmatched(message.id, result.reason);
         }
         db.exec("COMMIT");
       } catch (error) {
@@ -238,6 +243,7 @@ function createDelivery({
         throw error;
       }
       if (result.state === "accepted" && result.queueId) replies?.trackProgress(message.id, false);
+      else if (result.state === "queued") replies?.trackProgress(message.id, false, true);
       else replies?.finishProgress(message.id);
       if (result.state === "queued") {
         emit("delivery_deferred", { entry: message.id, reason: result.reason });
@@ -324,8 +330,10 @@ function createDelivery({
 
   function taskState(id, route) {
     return db.prepare(`SELECT m.id AS entry,
-      CASE WHEN m.state='queued_in_codex' AND r.total>0 THEN 'completed' ELSE m.state END AS delivery,
-      r.state AS reply,r.total,r.part,
+      CASE WHEN r.failure_reason='turn_failed' THEN 'failed'
+        WHEN m.state='queued_in_codex' AND r.failure_reason IS NOT NULL THEN 'uncertain'
+        WHEN m.state='queued_in_codex' AND r.total>0 THEN 'completed' ELSE m.state END AS delivery,
+      r.state AS reply,r.total,r.part,r.failure_reason AS failureReason,
       COALESCE(p.started,0) AS started FROM messages m JOIN bridge_replies r ON r.entry=m.id
       LEFT JOIN bridge_progress p ON p.entry=m.id WHERE m.msg_id=? AND r.chat_id=? AND r.chat_type=?`)
       .get(id, route.chatId, route.chatType);
@@ -341,7 +349,10 @@ function createDelivery({
       if (row?.reply === "failed" && row.part < row.total) {
         db.prepare("UPDATE bridge_replies SET state='ready',retry_at=0,attempts=0 WHERE entry=?").run(row.entry);
         answer = "已安排从未发出的分段继续回发。";
-      } else if (row?.delivery === "rejected") {
+      } else if (row?.delivery === "rejected" && ["registered", "sent", "failed"].includes(row.reply)) {
+        db.prepare("DELETE FROM bridge_reply_chunks WHERE entry=?").run(row.entry);
+        db.prepare("UPDATE bridge_replies SET state='registered',total=0,part=0,attempts=0,retry_at=0,failure_reason=NULL WHERE entry=?").run(row.entry);
+        db.prepare("DELETE FROM bridge_progress WHERE entry=?").run(row.entry);
         db.prepare("UPDATE messages SET state='queued', retry_dir=? WHERE id=?").run(originalDir, row.entry);
         answer = "已重新安排投递此前被拒绝的任务。";
       } else {

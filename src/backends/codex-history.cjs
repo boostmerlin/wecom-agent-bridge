@@ -3,17 +3,22 @@
 const { spawn } = require('node:child_process');
 const { isAbsolute } = require('node:path');
 const { createInterface } = require('node:readline');
+const { randomUUID } = require('node:crypto');
+const { createDiagnostics } = require('./cli-diagnostics.cjs');
 
 const header = /^(?:来自企业微信：\r?\n)?\[wecom-request:([0-9a-f]{32})\](?=\r?\n|$)/;
 
 const footer = /桥接自动回发，请勿代发或复述标记。\r?\n\[wecom-request:([0-9a-f]{32})\]$/;
 
-function openReader(codexPath, workingDir, execute, timeoutMs) {
+function openReader(codexPath, workingDir, execute, timeoutMs, diagnosticOptions) {
+  const diagnostics = diagnosticOptions && createDiagnostics('app-server', diagnosticOptions.prompt, diagnosticOptions.onDiagnostic);
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key]) => key.toUpperCase() !== 'WECOM_BOT_SECRET'));
   const child = execute(codexPath, ['app-server', '--stdio'], {
-    cwd: workingDir, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'ignore'],
+    cwd: workingDir, env, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', diagnostics ? 'pipe' : 'ignore'],
   });
+  child.stderr?.on('data', chunk => diagnostics?.capture(chunk.toString('utf8')));
+  child.on('close', (code, signal) => diagnostics?.report(code, signal));
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let nextId = 0, pending, closed = false;
   function disconnected() {
@@ -30,7 +35,10 @@ function openReader(codexPath, workingDir, execute, timeoutMs) {
     try { message = JSON.parse(line); } catch { return; }
     if (message.id !== pending.id) return;
     if (Object.hasOwn(message, 'result')) pending.resolve(message.result);
-    else pending.reject(new Error('Codex reply read request failed'));
+    else {
+      diagnostics?.error(message.error?.message);
+      pending.reject(new Error('Codex app-server request failed'));
+    }
   });
 
   const send = message => child.stdin.write(JSON.stringify(message) + '\n');
@@ -71,6 +79,7 @@ function inspectTurn(turn, wanted, observations) {
   for (const user of users) {
     const clientKey = 'client:' + user.clientId;
     if (user.clientId && wanted.has(clientKey)) tokens.add(clientKey);
+    if (user.clientId && wanted.has(user.clientId)) tokens.add(user.clientId);
     // Earlier releases embedded the correlation token in the prompt.
     const first = user.content?.[0];
     const token = first?.type === 'text' && typeof first.text === 'string' &&
@@ -186,4 +195,26 @@ async function readThreadCwd(options) {
   return cwd;
 }
 
-module.exports = { createReplyReader, readThread, readThreadCwd, listThreads };
+async function queueMessage({ codexPath, workingDir, threadId, prompt, replyToken,
+  execute = spawn, timeoutMs = 30_000, onDiagnostic }) {
+  let reader;
+  const clientId = replyToken || randomUUID();
+  try {
+    reader = openReader(codexPath, workingDir, execute, timeoutMs, { prompt, onDiagnostic });
+    await reader.initialize();
+    const { queuedSubmission } = await reader.request('thread/queue/add', {
+      threadId, clientUserMessageId: clientId, input: [{ type: 'text', text: prompt }],
+    });
+    if (typeof queuedSubmission?.id !== 'string' || !queuedSubmission.id.trim() || queuedSubmission.clientUserMessageId !== clientId) {
+      throw new Error('Unexpected queue receipt');
+    }
+    return { state: 'accepted', queueId: queuedSubmission.id, replyId: clientId, wakeConfirmed: false };
+  } catch {
+    // The add may have committed before the connection broke. Never submit again.
+    return { state: 'uncertain', reason: 'queue_outcome_unknown' };
+  } finally {
+    reader?.close();
+  }
+}
+
+module.exports = { createReplyReader, readThread, readThreadCwd, listThreads, queueMessage };

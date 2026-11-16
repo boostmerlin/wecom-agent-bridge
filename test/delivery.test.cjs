@@ -69,7 +69,7 @@ function fakeCli(scenario) {
     assert.equal(options.shell, false);
     assert.equal(options.windowsHide, true);
     const expected = scenario();
-    const fake = { ...expected, args: ['exec', '-c', 'sandbox_workspace_write.network_access=true', '-C', workingDir, 'resume', '--json', threadId, '-'],
+    const fake = { ...expected, args: ['exec', '-c', 'sandbox_workspace_write.network_access=true', '-C', workingDir, 'resume', '--json', '--skip-git-repo-check', threadId, '-'],
       body: buildWecomPrompt(expected.text) };
     return spawn(process.execPath, ['-e', childProgram, '--', ...args], {
       ...options, env: { ...options.env, FAKE_DELIVERY: JSON.stringify(fake) },
@@ -102,7 +102,7 @@ test('writes UTF-8 via stdin, serializes turns, and deduplicates across restarts
   assert.equal(maxActive, 1);
   assert.equal(calls, 2);
   assert.deepEqual(p.log.map((row) => row.event), ['delivery_queued', 'delivery_queued',
-    'delivery_submitted', 'delivery_completed', 'delivery_submitted', 'delivery_completed']);
+    'delivery_submitted', 'cli_exited', 'delivery_completed', 'delivery_submitted', 'cli_exited', 'delivery_completed']);
   const logs = JSON.stringify(p.log);
   for (const privateText of [...messages, '模拟回复', 'test-secret-should-stay-in-parent']) assert.ok(!logs.includes(privateText));
   const second = f.open({ execute: fake });
@@ -167,21 +167,18 @@ test('an active writer before any events falls back once, retaining the queue re
   t.after(() => { if (oldSecret === undefined) delete process.env.WECOM_BOT_SECRET; else process.env.WECOM_BOT_SECRET = oldSecret; });
   function execute(path, args, options) {
     calls.push(args[0]);
-    if (args[0] === 'exec') return firstCli(path, args, options);
-    assert.equal(path, 'fake-codex');
-    assert.equal(options.shell, false);
-    assert.deepEqual(args, ['queue', '--thread', threadId, '--message', buildWecomPrompt(text), '--resume']);
-    const fakeQueue = `
-      if ('WECOM_BOT_SECRET' in process.env || process.argv[5] !== process.env.FAKE_BODY) process.exit(25);
-      if (process.env.FAKE_WARN === '1') process.stderr.write('warning: queued message, could not resume local daemon\\n');
-    `;
-    return spawn(process.execPath, ['-e', fakeQueue, '--', ...args], {
-      ...options, env: { ...options.env, FAKE_BODY: buildWecomPrompt(text),
-        FAKE_WARN: calls.filter((command) => command === 'queue').length < 3 ? '1' : '0' },
-    });
+    assert.equal(args[0], 'exec');
+    return firstCli(path, args, options);
+  }
+  async function enqueue(turn) {
+    calls.push('queue');
+    assert.equal(turn.prompt, buildWecomPrompt(text));
+    assert.equal(turn.threadId, threadId);
+    return { state: 'accepted', queueId: 'queue-receipt', replyId: 'message-id',
+      ...(calls.filter(command => command === 'queue').length < 3 && { wakeConfirmed: false }) };
   }
   const wakeCalls = [];
-  const p = f.open({ execute, wakeDesktop(...args) {
+  const p = f.open({ execute, enqueue, wakeDesktop(...args) {
     wakeCalls.push(args);
     if (wakeCalls.length === 2) throw new Error('simulated protocol failure');
   } });
@@ -210,6 +207,8 @@ test('an active writer before any events falls back once, retaining the queue re
   await second.delivery.close();
   assert.deepEqual(wakeCalls, [[threadId], [threadId]]);
   assert.deepEqual(calls, ['exec', 'queue', 'exec', 'queue', 'exec', 'queue']);
+  assert.deepEqual(p.log.filter(row => row.event === 'cli_exited').map(row => [row.details.command, row.details.exitCode]),
+    [['exec', 1], ['exec', 1], ['exec', 1]]);
 });
 
 test('a crashed in-flight worker is quarantined; a different thread has its own deduplication scope', async (t) => {
@@ -242,15 +241,14 @@ test('correlates the group turn queued in Codex, sends only its concise final, a
   const sent = [];
   const p = f.open({
     execute(_exe, args, options) {
-      if (args[0] === 'exec') {
-        const program = 'process.stdin.resume();process.stdin.on("end",()=>{console.error("thread/resume failed: thread ' + threadId + ' already has an active writer");process.exitCode=1})';
-        return spawn(process.execPath, ['-e', program], options);
-      }
-      assert.equal(args[0], 'queue');
-      prompt = args[args.indexOf('--message') + 1];
-      const queueId = '01234567-89ab-4def-8123-012345678901';
-      marker = 'client:' + queueId;
-      return spawn(process.execPath, ['-e', 'console.log(' + JSON.stringify('Queued message ' + queueId + ' for thread ' + threadId + '.') + ')'], options);
+      assert.equal(args[0], 'exec');
+      const program = 'process.stdin.resume();process.stdin.on("end",()=>{console.error("thread/resume failed: thread ' + threadId + ' already has an active writer");process.exitCode=1})';
+      return spawn(process.execPath, ['-e', program], options);
+    },
+    async enqueue(turn) {
+      prompt = turn.prompt;
+      marker = 'client:' + turn.replyToken;
+      return { state: 'accepted', queueId: 'different-queue-id', replyId: turn.replyToken };
     },
     async readReplies(tokens) {
       assert.ok(tokens.includes(marker));
@@ -264,10 +262,11 @@ test('correlates the group turn queued in Codex, sends only its concise final, a
   t.after(() => clearTimeout(hold));
   p.delivery.enqueue('ws-id', '请总结', 'group', route, 'wecom-test-id');
   await done;
-  assert.match(prompt, /一至三句话/);
-  assert.match(prompt, /先完成正文要求的任务/);
-  assert.match(prompt, /正文指定了回复内容或格式，按其要求作答/);
-  assert.match(prompt, /桥接会将最终答复发回原企微会话，请勿自行发送这条答复/);
+  assert.match(prompt, /默认简洁/);
+  assert.match(prompt, /请完成正文要求的任务后回复实际结果/);
+  assert.match(prompt, /正文要求提供的代码、命令、文案等内容应完整给出/);
+  assert.match(prompt, /指定了回复内容或格式时，严格遵循/);
+  assert.match(prompt, /桥接会将最终答复发回原企微会话，请勿自行发送/);
   assert.doesNotMatch(prompt, /wecom-request/);
   assert.ok(prompt.startsWith('请总结\n\n'));
   assert.deepEqual(sent, [[route, '核心结论']]);
@@ -311,6 +310,7 @@ test('fresh inbox creates one thread and resumes it across messages and a restar
     threadId: undefined, queueKey, onCreated: id => created.push(id),
     execute(_exe, args, options) {
       calls.push(args);
+      assert.ok(args.includes('--skip-git-repo-check'));
       const script = 'process.stdin.resume();process.stdin.on("end",()=>{' +
         'for(const e of ' + JSON.stringify(completed) + ') console.log(JSON.stringify(e))})';
       return spawn(process.execPath, ['-e', script], options);
@@ -382,16 +382,19 @@ test('only a rejected submission can be manually executed again', async t => {
   const f = fixture(t);
   const route = { chatType: 'single', chatId: 'owner', senderId: 'owner' };
   let submissions = 0;
+  const notices = [];
   const p = f.open({ backend: { submit: async () => ({ state: ++submissions === 1 ? 'rejected' : 'uncertain' }) },
-    sendReply: async () => assert.fail('No final') });
-  const rejected = p.event('delivery_rejected');
+    sendReply: async (_, text) => notices.push(text) });
+  const rejected = p.event('reply_sent');
   p.delivery.enqueue('task', 'run', 'single', route);
   await rejected;
-  const uncertain = p.event('delivery_uncertain');
+  const uncertain = p.event('reply_sent');
   assert.match(p.delivery.retryTask('retry-1', 'task', route), /投递此前被拒绝/);
   await uncertain;
   assert.match(p.delivery.retryTask('retry-2', 'task', route), /没有可安全重试/);
   assert.equal(submissions, 2);
+  assert.match(notices[0], /未接受任务/);
+  assert.match(notices[1], /任务可能已开始/);
 });
 
 test('progress storage failures leave the turn and its final reply intact', async t => {
@@ -428,6 +431,7 @@ test('external and unidentified senders run isolated even when the message claim
       assert.equal(args[args.indexOf('--sandbox') + 1], 'workspace-write');
       for (const flag of ['--ephemeral', '--ignore-user-config', '--ignore-rules', 'sandbox_workspace_write.network_access=true'])
         assert.ok(args.includes(flag), flag);
+      assert.ok(args.includes('--skip-git-repo-check'));
       if (process.platform === 'win32') assert.ok(args.includes('windows.sandbox="elevated"'));
       assert.equal(options.cwd, f.stateDir);
       assert.equal(args[args.indexOf('-C') + 1], f.stateDir);
@@ -462,12 +466,89 @@ test('unsupported external sandbox rejects the original sender again on manual r
   };
   const first = f.open(options);
   const rejected = first.event('delivery_rejected');
+  const notified = first.event('reply_sent');
   first.delivery.enqueue('guest', 'test', 'group', route);
   assert.equal((await rejected)[0].reason, 'external_sandbox_unsupported');
+  await notified;
   await first.delivery.close();
   const second = f.open(options);
   const retried = second.event('delivery_rejected');
   second.delivery.retryTask('owner-retry', 'guest', { ...route, senderId: 'owner' });
   assert.equal((await retried)[0].reason, 'external_sandbox_unsupported');
   assert.equal(unrestricted, 0);
+});
+
+test('CLI failure logs the exit code and sends one safe notice to its original chat across restart', async t => {
+  const f = fixture(t);
+  const route = { chatType: 'group', chatId: 'original-group', senderId: 'owner' };
+  const sent = [];
+  let launches = 0;
+  const options = {
+    execute(_exe, args, options) {
+      launches++;
+      assert.ok(args.includes('--skip-git-repo-check'));
+      return spawn(process.execPath, ['-e', 'process.stdin.resume();process.stdin.on("end",()=>{console.error("Not inside a trusted directory. token=private-key");process.exitCode=1})'], options);
+    },
+    sendReply: async (origin, text) => sent.push([origin, text]),
+  };
+  const first = f.open(options);
+  const notified = first.event('reply_sent');
+  first.delivery.enqueue('failure', 'test', 'group', route);
+  await notified;
+  const diagnostic = first.log.find(row => row.event === 'cli_exited').details;
+  assert.equal(diagnostic.exitCode, 1);
+  assert.equal(diagnostic.signal, null);
+  assert.match(diagnostic.errorSummary, /Not inside a trusted directory/);
+  assert.ok(!diagnostic.errorSummary.includes('private-key'));
+  assert.match(diagnostic.requestId, /^[a-f0-9]{32}$/);
+  assert.deepEqual(sent[0][0], route);
+  assert.match(sent[0][1], /任务可能已开始/);
+  assert.ok(sent[0][1].includes(diagnostic.requestId));
+  assert.ok(!sent[0][1].includes('trusted directory'));
+  assert.equal(first.delivery.taskState('failure', route).delivery, 'uncertain');
+  await first.delivery.close();
+  const second = f.open(options);
+  assert.equal(second.delivery.enqueue('failure', 'again', 'group', route), false);
+  await second.delivery.close();
+  assert.equal(sent.length, 1);
+  assert.equal(launches, 1);
+});
+
+test('a rejected task can complete after its failure notice without losing the final reply', async t => {
+  const f = fixture(t);
+  const route = { chatType: 'single', chatId: 'owner', senderId: 'owner' };
+  const sent = [];
+  let launches = 0;
+  const p = f.open({ backend: { submit: async () => ++launches === 1
+    ? { state: 'rejected', reason: 'E2BIG' } : { state: 'completed', text: 'final result' } },
+  sendReply: async (origin, text) => sent.push([origin, text]) });
+  const notice = p.event('reply_sent');
+  p.delivery.enqueue('retryable', 'test', 'single', route);
+  await notice;
+  assert.match(sent[0][1], /未接受任务/);
+  const result = p.event('reply_sent');
+  assert.match(p.delivery.retryTask('retry', 'retryable', route), /已重新安排/);
+  await result;
+  assert.deepEqual(sent[1], [route, 'final result']);
+  assert.equal(p.delivery.taskState('retryable', route).failureReason, null);
+  assert.equal(p.delivery.taskState('retryable', route).delivery, 'completed');
+  assert.equal(launches, 2);
+});
+
+test('temporarily missing CLI sends a deferred notice and still returns the final after restart', async t => {
+  const f = fixture(t);
+  const route = { chatType: 'single', chatId: 'owner', senderId: 'owner' };
+  const sent = [];
+  const sendReply = async (origin, text) => sent.push([origin, text]);
+  const first = f.open({ execute() { throw Object.assign(new Error('missing CLI'), { code: 'ENOENT' }); }, sendReply });
+  const notice = first.event('progress_sent');
+  first.delivery.enqueue('deferred', 'test', 'single', route);
+  await notice;
+  assert.match(sent[0][1], /会自动重试/);
+  assert.equal(first.log.find(row => row.event === 'cli_exited').details.errorCode, 'ENOENT');
+  await first.delivery.close();
+  const second = f.open({ backend: { submit: async () => ({ state: 'completed', text: 'recovered' }) }, sendReply });
+  await second.event('reply_sent');
+  assert.deepEqual(sent[1], [route, 'recovered']);
+  assert.equal(sent.length, 2);
 });
