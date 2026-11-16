@@ -60,7 +60,7 @@ function openReader(codexPath, workingDir, execute, timeoutMs, diagnosticOptions
   return {
     async initialize() {
       await request('initialize', {
-        clientInfo: { name: 'wecom-codex-bridge', version: '1.0' },
+        clientInfo: { name: 'wecom-agent-bridge', version: '1.0' },
         capabilities: { experimentalApi: true },
       });
       send({ method: 'initialized' });
