@@ -197,7 +197,7 @@ async function runBridge(config) {
       const inbox = path.join(stateDir, botKey, storageKey(queueKey));
       const snapshot = () => ({ threadId: current.threadId, workingDir: current.workingDir, queueKey });
       current.delivery = createDelivery({
-        ...snapshot(), backend, stateDir: inbox, sendReply,
+        ...snapshot(), backend, ownerId: config.ownerId, stateDir: inbox, sendReply,
         progressAfterMs: config.progressAfterMs,
         progressText: async route => {
           const title = route.senderId === config.ownerId ? await chatTitle(backend, current.threadId) : backend.name;

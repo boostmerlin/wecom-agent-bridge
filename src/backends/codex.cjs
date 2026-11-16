@@ -1,7 +1,6 @@
 "use strict";
 
 const { spawn } = require("node:child_process");
-const { createHash } = require("node:crypto");
 const { readFileSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { createInterface } = require("node:readline");
@@ -24,10 +23,16 @@ const invalidArguments = new Set([
 ]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function childEnvironment() {
+// Desktop session handles and permission selectors belong to the owner session.
+const desktopKeys = new Set([
+  "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_PERMISSION_PROFILE", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+  "CODEX_WINDOWS_REGISTERED_CORE", "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY",
+]);
+
+function childEnvironment(external = false) {
   return Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => key.toUpperCase() !== "WECOM_BOT_SECRET",
+      ([key]) => key.toUpperCase() !== "WECOM_BOT_SECRET" && !(external && desktopKeys.has(key.toUpperCase())),
     ),
   );
 }
@@ -128,8 +133,27 @@ function queueInCodex(execute, codexPath, threadId, prompt, options) {
   });
 }
 
-function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, autoCreated }, outputFile) {
-  const args = ["exec", "-C", workingDir];
+function externalArgs(workingDir) {
+  const args = ["-a", "never",
+    "-c", "sandbox_workspace_write.network_access=true",
+    "-c", "sandbox_workspace_write.writable_roots=[]",
+    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+    "-c", "mcp_servers={}",
+    "-c", "features.skip_host_skill_discovery=true",
+    "-c", "projects." + JSON.stringify(workingDir) + '.trust_level="untrusted"',
+  ];
+  for (const feature of ["apps", "plugins", "hooks", "browser_use", "computer_use",
+    "multi_agent", "multi_agent_v2", "request_permissions_tool", "skill_mcp_dependency_install"]) {
+    args.push("--disable", feature);
+  }
+  if (process.platform === "win32") args.push("-c", 'windows.sandbox="elevated"');
+  return [...args, "exec", "--sandbox", "workspace-write", "--ephemeral",
+    "--ignore-user-config", "--ignore-rules", "-C", workingDir];
+}
+
+function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, autoCreated }, outputFile, external) {
+  const args = external ? externalArgs(workingDir) : ["exec", "-c", "sandbox_workspace_write.network_access=true", "-C", workingDir];
   if (threadId) args.push("resume");
   args.push("--json");
   if (!threadId || autoCreated) args.push("--skip-git-repo-check");
@@ -139,7 +163,8 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
   const options = {
     shell: false,
     windowsHide: true,
-    env: childEnvironment(),
+    env: childEnvironment(external),
+    ...(external && { cwd: workingDir }),
     stdio: ["pipe", "pipe", "pipe"],
   };
   return new Promise((resolve) => {
@@ -190,7 +215,7 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
           if (!threadId && uuid.test(event.thread_id)) {
             threadId = event.thread_id;
             try {
-              onCreated(threadId);
+              if (!external) onCreated(threadId);
             } catch {
               wrongThread = true;
               child.kill();
@@ -220,7 +245,7 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
     );
     child.once("close", (code) => {
       if (launchError) return resolve(launchFailure(child, launchError));
-      if (code === 1 && activeWriter && !sawEvent && !inputFailed) {
+      if (!external && code === 1 && activeWriter && !sawEvent && !inputFailed) {
         return resolve(
           queueInCodex(execute, codexPath, threadId, prompt, options),
         );
@@ -257,6 +282,19 @@ function parseThreadId(value) {
 
 function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestDesktopWake }) {
   if (typeof codexPath !== "string" || !codexPath.trim()) throw new Error("Missing Codex executable");
+  async function submitTurn(turn, external) {
+    const outputFile = turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
+    try {
+      const result = await runTurn(execute, codexPath, turn, outputFile, external);
+      if (outputFile && result.state === "completed") {
+        try { result.text = readFileSync(outputFile, "utf8"); }
+        catch { /* A missing final cannot be sent back to the chat. */ }
+      }
+      return result;
+    } finally {
+      if (outputFile) rmSync(outputFile, { force: true });
+    }
+  }
   return {
     id: "codex",
     name: "Codex",
@@ -273,19 +311,8 @@ function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestD
     readReplies: (target, keys) => createReplyReader({ codexPath, ...target })(keys),
     replyKey: queueId => "client:" + queueId,
     acceptedEvent: "delivery_queued_in_codex",
-    async submit(turn) {
-      const outputFile = turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
-      try {
-        const result = await runTurn(execute, codexPath, turn, outputFile);
-        if (outputFile && result.state === "completed") {
-          try { result.text = readFileSync(outputFile, "utf8"); }
-          catch { /* A missing final cannot be sent back to the chat. */ }
-        }
-        return result;
-      } finally {
-        if (outputFile) rmSync(outputFile, { force: true });
-      }
-    },
+    submit: turn => submitTurn(turn, false),
+    submitExternal: turn => submitTurn({ ...turn, threadId: undefined }, true),
     async afterAccepted(result, threadId, log) {
       if (result.wakeConfirmed !== false) return;
       if (threadId.length !== 36 || !uuid.test(threadId)) {

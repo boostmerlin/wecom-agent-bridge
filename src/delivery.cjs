@@ -15,6 +15,7 @@ function buildWecomPrompt(text) {
 
 function createDelivery({
   backend,
+  ownerId,
   threadId,
   workingDir,
   stateDir,
@@ -35,6 +36,7 @@ function createDelivery({
   }
   if (!threadId && typeof onCreated !== "function")
     throw new Error("Missing new chat handler");
+  const isOwner = senderId => Boolean(ownerId) && senderId === ownerId;
   let logContext;
   const emit = (event, details) => {
     if (details?.entry != null && sendReply) {
@@ -119,7 +121,7 @@ function createDelivery({
       "INSERT INTO messages(msg_id, body, sender_id, wecom_request_id, state) VALUES(?, ?, ?, ?, 'queued') ON CONFLICT(msg_id) DO NOTHING",
     );
     nextMessage = db.prepare(
-      "SELECT id, body, retry_dir FROM messages WHERE state = 'queued' ORDER BY id LIMIT 1",
+      "SELECT id, body, retry_dir, sender_id FROM messages WHERE state = 'queued' ORDER BY id LIMIT 1",
     );
     markSubmitting = db.prepare(
       "UPDATE messages SET state = 'submitting' WHERE id = ?",
@@ -140,12 +142,12 @@ function createDelivery({
     db.exec("BEGIN IMMEDIATE");
     const interrupted = db
       .prepare(
-        "UPDATE messages SET state = 'uncertain' WHERE state = 'submitting' RETURNING id",
+        "UPDATE messages SET state = 'uncertain' WHERE state = 'submitting' RETURNING id, sender_id",
       )
       .all();
-    for (const { id } of interrupted) {
+    for (const { id, sender_id } of interrupted) {
       if (replies?.tokenFor(id)) {
-        if (readReplies) replies.start(id, { blocking: false });
+        if (isOwner(sender_id) && readReplies) replies.start(id, { blocking: false });
         else replies.unmatched(id);
       }
     }
@@ -192,14 +194,17 @@ function createDelivery({
       const token = replies?.tokenFor(message.id);
       let result;
       try {
-        result = await backend.submit({
-          workingDir: message.retry_dir ?? workingDir, threadId, stateDir, replyToken: token,
-          autoCreated: queueKey !== threadId,
+        const owner = isOwner(message.sender_id);
+        const turn = {
+          workingDir: message.retry_dir ?? workingDir, stateDir, replyToken: token,
           prompt: buildWecomPrompt(message.body),
           onStarted() {
             replies?.trackProgress(message.id, true);
             emit("delivery_submitted", { entry: message.id });
           },
+        };
+        if (owner) result = await backend.submit({
+          ...turn, threadId, autoCreated: queueKey !== threadId,
           onCreated(id) {
             threadId = pendingBinding = id;
             db.prepare("INSERT INTO bridge_target(id,thread_id) VALUES(1,?)").run(id);
@@ -207,6 +212,8 @@ function createDelivery({
             pendingBinding = undefined;
           },
         });
+        else if (backend.submitExternal) result = await backend.submitExternal(turn);
+        else result = { state: "rejected", reason: "external_sandbox_unsupported" };
       } catch {
         // The backend may already have started processing. Never submit it twice.
         result = { state: "uncertain", reason: "backend_outcome_unknown" };

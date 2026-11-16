@@ -21,7 +21,7 @@ test('单聊与群聊保留原文和来源，本人与其他发送者均可转�
       assert.equal(result.chatType, chattype);
       assert.ok(result.text.startsWith('企微' + label + ' · ' + (sender === 'owner' ? '本人' : '外部用户') + '\n'));
       if (sender === 'owner') assert.equal(result.text, '企微' + label + ' · 本人\n\n' + body.text.content);
-      else assert.match(result.text, /无权.*本机命令.*披露项目内容。[\s\S]+> @机器人 第一行\n> 第二行$/);
+      else assert.match(result.text, /可联网审阅.*合并授权不适用于此人。[\s\S]+> @机器人 第一行\n> 第二行$/);
     }
   }
 });

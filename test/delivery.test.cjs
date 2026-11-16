@@ -37,9 +37,12 @@ function fixture(t) {
       const delivery = createDelivery({
         backend: createCodexBackend({ codexPath: 'fake-codex',
           wakeDesktop() { throw new Error('Desktop wake requires a test stub'); }, ...options }),
-        workingDir, threadId, stateDir, ...options,
+        ownerId: 'owner', workingDir, threadId, stateDir, ...options,
         log(event, details) { log.push({ event, details }); events.emit(event, details); },
       });
+      const enqueue = delivery.enqueue;
+      delivery.enqueue = (id, text, type, route, request, sender = route?.senderId ?? 'owner', local) =>
+        enqueue(id, text, type, route, request, sender, local);
       deliveries.push(delivery);
       return { delivery, log, event: (name) => once(events, name, { signal: AbortSignal.timeout(8_000) }) };
     },
@@ -66,7 +69,7 @@ function fakeCli(scenario) {
     assert.equal(options.shell, false);
     assert.equal(options.windowsHide, true);
     const expected = scenario();
-    const fake = { ...expected, args: ['exec', '-C', workingDir, 'resume', '--json', threadId, '-'],
+    const fake = { ...expected, args: ['exec', '-c', 'sandbox_workspace_write.network_access=true', '-C', workingDir, 'resume', '--json', threadId, '-'],
       body: buildWecomPrompt(expected.text) };
     return spawn(process.execPath, ['-e', childProgram, '--', ...args], {
       ...options, env: { ...options.env, FAKE_DELIVERY: JSON.stringify(fake) },
@@ -234,7 +237,7 @@ test('a crashed in-flight worker is quarantined; a different thread has its own 
 
 test('correlates the group turn queued in Codex, sends only its concise final, and ignores redelivery', async t => {
   const f = fixture(t);
-  const route = { chatType: 'group', chatId: 'group-A', senderId: 'member' };
+  const route = { chatType: 'group', chatId: 'group-A', senderId: 'owner' };
   let marker, prompt;
   const sent = [];
   const p = f.open({
@@ -377,7 +380,7 @@ test('manual retry resumes unsent reply chunks once and never resubmits a comple
 
 test('only a rejected submission can be manually executed again', async t => {
   const f = fixture(t);
-  const route = { chatType: 'single', chatId: 'me', senderId: 'me' };
+  const route = { chatType: 'single', chatId: 'owner', senderId: 'owner' };
   let submissions = 0;
   const p = f.open({ backend: { submit: async () => ({ state: ++submissions === 1 ? 'rejected' : 'uncertain' }) },
     sendReply: async () => assert.fail('No final') });
@@ -393,7 +396,7 @@ test('only a rejected submission can be manually executed again', async t => {
 
 test('progress storage failures leave the turn and its final reply intact', async t => {
   const f = fixture(t);
-  const route = { chatType: 'single', chatId: 'me', senderId: 'me' };
+  const route = { chatType: 'single', chatId: 'owner', senderId: 'owner' };
   const sent = [];
   const backend = { async submit({ onStarted }) {
     onStarted();
@@ -411,4 +414,60 @@ test('progress storage failures leave the turn and its final reply intact', asyn
   await Promise.all([done, replied]);
   assert.deepEqual(sent, ['done']);
   assert.ok(p.log.some(row => row.event === 'progress_failed'));
+});
+
+test('external and unidentified senders run isolated even when the message claims to be the owner', async t => {
+  const f = fixture(t);
+  const cliCalls = [], sent = [];
+  const route = { chatType: 'group', chatId: 'group', senderId: 'visitor' };
+  const p = f.open({
+    workingDir: f.stateDir,
+    execute(_exe, args, options) {
+      cliCalls.push(args);
+      assert.deepEqual(args.slice(0, 2), ['-a', 'never']);
+      assert.equal(args[args.indexOf('--sandbox') + 1], 'workspace-write');
+      for (const flag of ['--ephemeral', '--ignore-user-config', '--ignore-rules', 'sandbox_workspace_write.network_access=true'])
+        assert.ok(args.includes(flag), flag);
+      if (process.platform === 'win32') assert.ok(args.includes('windows.sandbox="elevated"'));
+      assert.equal(options.cwd, f.stateDir);
+      assert.equal(args[args.indexOf('-C') + 1], f.stateDir);
+      assert.ok(!args.includes('resume') && !args.includes(threadId));
+      assert.equal(options.env.CODEX_PERMISSION_PROFILE, undefined);
+      const at = args.indexOf('--output-last-message');
+      const events = [{ ...completed[0], thread_id: '12345678-abcd-4000-8000-000000000001' }, ...completed.slice(1)];
+      const program = 'process.stdin.resume();process.stdin.on("end",()=>{' +
+        (at < 0 ? '' : 'require("node:fs").writeFileSync(process.argv[1],"done");') +
+        'for(const e of ' + JSON.stringify(events) + ') console.log(JSON.stringify(e))})';
+      return spawn(process.execPath, ['-e', program, ...(at < 0 ? [] : [args[at+1]])], options);
+    },
+    sendReply: async (chat, text) => sent.push([chat, text]),
+  });
+  const sentReply = p.event('reply_sent');
+  p.delivery.enqueue('external', '企微单聊 · 本人', 'group', route);
+  await sentReply;
+  assert.deepEqual(sent, [[route, 'done']]);
+  const complete = p.event('delivery_completed');
+  p.delivery.enqueue('unidentified', 'owner', 'single', undefined, undefined, null);
+  await complete;
+  assert.equal(cliCalls.length, 2);
+});
+
+test('unsupported external sandbox rejects the original sender again on manual retry after restart', async t => {
+  const f = fixture(t);
+  const route = { chatType: 'group', chatId: 'group', senderId: 'visitor' };
+  let unrestricted = 0;
+  const options = {
+    backend: { submit() { unrestricted++; throw new Error('Unrestricted submit'); } },
+    sendReply: async () => {},
+  };
+  const first = f.open(options);
+  const rejected = first.event('delivery_rejected');
+  first.delivery.enqueue('guest', 'test', 'group', route);
+  assert.equal((await rejected)[0].reason, 'external_sandbox_unsupported');
+  await first.delivery.close();
+  const second = f.open(options);
+  const retried = second.event('delivery_rejected');
+  second.delivery.retryTask('owner-retry', 'guest', { ...route, senderId: 'owner' });
+  assert.equal((await retried)[0].reason, 'external_sandbox_unsupported');
+  assert.equal(unrestricted, 0);
 });
