@@ -15,14 +15,19 @@ test('command aliases, memory scopes, stable deletion IDs and atomic replay', t 
   const route = { chatType: 'single', chatId: 'me', senderId: 'me' };
   const scope = store.scope(dir, route);
   const parse = content => parseCommand({ msgtype: 'text', chattype: 'group', text: { content } });
-  assert.deepEqual(parse('@机器人 /save 请view 时审查 MR'), parse('/记住 请view 时审查 MR'));
+  assert.deepEqual(parse('@机器人 /memory 请view 时审查 MR'), parse('/记忆 请view 时审查 MR'));
   assert.equal(parse('提到 /new'), null);
-  assert.equal(parse('/saveMore a'), null);
+  assert.equal(parse('/save 内容'), null);
+  assert.equal(parse('/save'), null);
+  assert.equal(parse('/memoryMore a'), null);
   assert.equal(parseCommand({ msgtype: 'voice', voice: { content: '/new' } }), null);
-  store.memory(parse('/save 测试命令 = npm test'), scope);
-  store.memory(parse('/save 测试命令 = node --test'), scope);
+  assert.match(store.memory(parse('/memory   '), scope), /还没有记忆/);
+  assert.match(store.memory(parse('/memory 测试命令 = npm test'), scope), /已记住 #1/);
+  store.memory(parse('/记忆 测试命令 = node --test'), scope);
   assert.deepEqual(parse('@机器人 /memory'), parse('/记忆'));
   assert.equal(store.memory(parse('/memory'), scope), '#1 测试命令 = node --test');
+  assert.equal(store.memory(parse('/MEMORY \n  '), scope), '#1 测试命令 = node --test');
+  assert.match(store.memory(parse('/memory ' + '长'.repeat(1001)), scope), /最多 1000/);
   assert.match(store.append('请测试', dir, route), /node --test/);
   for (const other of [{ ...route, chatType: 'group' }, { ...route, senderId: 'guest' }]) {
     assert.equal(store.append('请测试', dir, other), '请测试');
@@ -85,8 +90,8 @@ test('verified WS commands switch the live target in order and acknowledge the o
     client.emit('message',{headers:{req_id:id}, body:{msgid:id, chattype:'group',chatid:group,
       from:{userid:sender},msgtype:'text',text:{content}}});
   }
-  push('s','/save 当我说请view时，审查指定 MR，通过后合并');
-  push('s','/save 当我说请view时，审查指定 MR，通过后合并');
+  push('s','/memory 当我说请view时，审查指定 MR，通过后合并');
+  push('s','/memory 当我说请view时，审查指定 MR，通过后合并');
   push('list','/threads');
   push('list-denied','/threads','guest');
   push('owner','请view !123');

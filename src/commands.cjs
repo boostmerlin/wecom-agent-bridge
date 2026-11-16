@@ -8,10 +8,10 @@ function parseCommand(body) {
   if (body.msgtype !== 'text' || typeof body.text?.content !== 'string') return null;
   let text = body.text.content.trim();
   if (body.chattype === 'group') text = text.replace(/^@[^\s]+\s+/, '');
-  const match = /^\/(记住|save|记忆|memory|忘记|forget|new|cwd|thread|threads|status|bind|retry|help)(?:\s+([\s\S]*))?$/i.exec(text);
+  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|status|bind|retry|help)(?:\s+([\s\S]*))?$/i.exec(text);
   if (!match) return null;
   const name = match[1].toLowerCase();
-  const aliases = { save: '记住', memory: '记忆', forget: '忘记' };
+  const aliases = { memory: '记忆', forget: '忘记' };
   return { name: aliases[name] ?? name, arg: (match[2] || '').trim() };
 }
 
@@ -25,8 +25,7 @@ const helpText = [
   '/thread <ID 或链接>  切换聊天',
   '/new  新开聊天；/cwd <绝对目录>  换目录并新开聊天',
   '/retry  重试本会话上一条任务中确定失败的环节',
-  '/记住 或 /save <内容>  保存记忆',
-  '/记忆 或 /memory  查看记忆',
+  '/memory 或 /记忆  查看记忆；后接内容则保存',
   '/忘记 或 /forget <编号或内容>  删除记忆',
   '绑定后切换目录或聊天只影响本会话。管理指令限机器人绑定的本人使用。',
 ].join('\n');
@@ -64,8 +63,7 @@ function createCommandStore(directory) {
   function memory(command, key) {
     const rows = notes.all(key);
     const { arg, name } = command;
-    if (name === '记忆') {
-      if (arg) return '用法：/记忆 或 /memory';
+    if (name === '记忆' && !arg) {
       return rows.length ? rows.map(row => '#' + row.id + ' ' + (row.name ? row.name + ' = ' : '') + row.body).join('\n') : '当前会话和目录还没有记忆。';
     }
     if (name === '忘记') {
@@ -74,7 +72,7 @@ function createCommandStore(directory) {
       db.prepare('DELETE FROM notes WHERE scope=? AND id=?').run(key, row.id);
       return '已删除记忆 #' + row.id;
     }
-    if (!arg || arg.length > 1000) return '用法：/记住 一条约定（最多 1000 个字符）';
+    if (!arg || arg.length > 1000) return '用法：/memory 一条约定（最多 1000 个字符）；不带内容则查看记忆。';
     const pair = /^(.{1,80}?)\s+=\s+([\s\S]+)$/.exec(arg);
     const label = pair ? pair[1].trim() : null;
     const body = pair ? pair[2].trim() : arg;

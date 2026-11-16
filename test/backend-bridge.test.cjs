@@ -112,7 +112,8 @@ test('another backend handles WeCom commands, new turns and replies across a res
   assert.match(calls[1].prompt, /企微群聊/);
   const before = calls.length;
   const help = await send('/help', true);
-  for (const name of ['/status', '/bind', '/retry', '/threads', '/save', '/memory', '/forget']) assert.ok(help.includes(name));
+  for (const name of ['/status', '/bind', '/retry', '/threads', '/memory', '/forget']) assert.ok(help.includes(name));
+  assert.ok(!help.includes('/save'));
   const groupStatus = await send('/status', true);
   assert.match(groupStatus, /上一条任务 → chat\/c/);
   assert.match(groupStatus, /投递：已完成；回复：已回发/);
