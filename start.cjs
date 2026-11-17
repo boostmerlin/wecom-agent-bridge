@@ -1,10 +1,9 @@
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
 const { promptSecret } = require('./src/secret-input.cjs');
-const { resolveTarget, runBridge } = require('./src/main.cjs');
-const { readIdentity, resolveCodex } = require('./src/launcher-tools.cjs');
+const { readBackend, readTaskTimeout, resolveTarget, runBridge } = require('./src/main.cjs');
+const { readIdentity, resolveCodex, resolveClaude } = require('./src/launcher-tools.cjs');
 
-const { createCodexBackend } = require('./src/backends/codex.cjs');
 const { secretStore } = require('./src/secret-store.cjs');
 
 function printTarget({ workingDir, threadId }, name) {
@@ -29,7 +28,11 @@ async function start() {
       return;
     }
   }
-  const backend = createCodexBackend({ codexPath: await resolveCodex() });
+  const backendId = readBackend();
+  const taskTimeoutMs = readTaskTimeout();
+  const backend = backendId === 'claude'
+    ? require('./src/backends/claude.cjs').createClaudeBackend({ claudePath: await resolveClaude() })
+    : require('./src/backends/codex.cjs').createCodexBackend({ codexPath: await resolveCodex() });
   const target = await resolveTarget(backend);
   printTarget(target, backend.name);
   console.log('正在核对企微机器人身份…');
@@ -53,7 +56,7 @@ async function start() {
       };
     }
   }
-  await runBridge({ ...target, backend, botId, ownerId, secret, onAuthenticated });
+  await runBridge({ ...target, backend, botId, ownerId, secret, onAuthenticated, taskTimeoutMs });
 }
 
 start().catch(error => {
