@@ -5,6 +5,7 @@ const { mkdirSync } = require("node:fs");
 const { join } = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const { createReplies } = require("./replies.cjs");
+const { taskTimeout } = require('./process-lifecycle.cjs');
 
 function buildWecomPrompt(text) {
   return (
@@ -21,10 +22,11 @@ function createDelivery({
   stateDir,
   log = () => {},
   readReplies = backend?.readReplies && (keys => backend.readReplies({ threadId, workingDir }, keys)),
-  sendReply, progressText, progressAfterMs,
+  sendReply, progressText, progressAfterMs, taskTimeoutMs,
   queueKey = threadId,
   onCreated,
 }) {
+  taskTimeoutMs = taskTimeout(taskTimeoutMs);
   if (
     typeof backend?.submit !== "function" || ![queueKey, workingDir, stateDir].every(
       (value) => typeof value === "string" && value.trim(),
@@ -61,6 +63,7 @@ function createDelivery({
   const base = join(stateDir, "delivery-" + threadKey);
   const lock = new DatabaseSync(base + ".lock.sqlite");
   let pendingBinding;
+  let activeTurn;
   let db, insert, nextMessage, markSubmitting, markResult, replies;
   let stopped = false,
     worker,
@@ -88,6 +91,7 @@ function createDelivery({
       }
     }
     db.exec("CREATE TABLE IF NOT EXISTS manual_retries (command TEXT PRIMARY KEY, answer TEXT NOT NULL)");
+    db.exec("CREATE TABLE IF NOT EXISTS manual_cancellations (command TEXT PRIMARY KEY, answer TEXT NOT NULL)");
     const previous = db
       .prepare(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'messages'",
@@ -192,12 +196,16 @@ function createDelivery({
       // leaves one ambiguous row for review instead of risking a second remote submission.
       markSubmitting.run(message.id);
       const token = replies?.tokenFor(message.id);
+      const controller = new AbortController();
+      activeTurn = { entry: message.id, controller, cancellable: backend.supportsCancellation === true };
       let result;
       try {
         const owner = isOwner(message.sender_id);
         const turn = {
           workingDir: message.retry_dir ?? workingDir, stateDir, replyToken: token,
+          signal: controller.signal, timeoutMs: taskTimeoutMs,
           prompt: buildWecomPrompt(message.body),
+          onDetached() { activeTurn.cancellable = false; },
           onStarted() {
             replies?.trackProgress(message.id, true);
             emit("delivery_submitted", { entry: message.id });
@@ -205,6 +213,7 @@ function createDelivery({
           onDiagnostic(details) {
             emit("cli_exited", { entry: message.id, ...details });
           },
+          onWarning(details) { emit('cli_warning', { entry: message.id, ...details }); },
         };
         if (owner) result = await backend.submit({
           ...turn, threadId, autoCreated: queueKey !== threadId,
@@ -220,7 +229,7 @@ function createDelivery({
       } catch {
         // The backend may already have started processing. Never submit it twice.
         result = { state: "uncertain", reason: "backend_outcome_unknown" };
-      }
+      } finally { activeTurn = undefined; }
       // Existing SQLite queues use this spelling for remote acceptance.
       const storedState = result.state === "accepted" ? "queued_in_codex" : result.state;
       db.exec("BEGIN IMMEDIATE");
@@ -234,7 +243,9 @@ function createDelivery({
           if (result.state === "completed" && result.text?.trim()) replies.ready(message.id, result.text);
           else if (result.queueId && readReplies) replies.start(message.id);
           else if (result.state === "rejected") replies.unmatched(message.id, result.reason || "delivery_rejected",
-            "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
+            result.reason === 'external_sandbox_unsupported'
+              ? '当前后端暂不支持其他人的任务，本条消息未执行。请由机器人绑定的本人发送任务。'
+              : "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
           else replies.unmatched(message.id, result.reason);
         }
         db.exec("COMMIT");
@@ -369,9 +380,39 @@ function createDelivery({
     return answer;
   }
 
+  function cancelTask(commandId, id, route) {
+    const prior = db.prepare('SELECT answer FROM manual_cancellations WHERE command=?').get(commandId);
+    if (prior) return prior.answer;
+    let answer, abort, cancelledEntry;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = taskState(id, route);
+      if (row?.delivery === 'queued') {
+        markResult.run('uncertain', 'uncertain', row.entry);
+        replies.unmatched(row.entry, 'task_cancelled', '任务已在本地队列中取消，尚未执行。');
+        replies.finishProgress(row.entry);
+        cancelledEntry = row.entry;
+        answer = '已取消尚未执行的任务。';
+      } else if (row?.delivery === 'submitting' && activeTurn?.entry === row.entry && activeTurn.cancellable) {
+        abort = activeTurn.controller;
+        answer = '已请求取消本会话上一条任务。已经产生的改动不会撤销，桥接不会自动重跑。';
+      } else if (row?.delivery === 'queued_in_codex' || (row?.delivery === 'submitting' && !activeTurn?.cancellable)) {
+        answer = '任务已交给后端队列，或后端不支持取消。请在目标聊天中停止任务。';
+      } else answer = '没有可取消的任务。';
+      db.prepare('INSERT INTO manual_cancellations VALUES(?,?)').run(commandId, answer);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    abort?.abort('task_cancelled');
+    if (cancelledEntry != null) emit('delivery_uncertain', { entry: cancelledEntry, reason: 'task_cancelled' });
+    replies?.wake();
+    wake();
+    return answer;
+  }
+
   function close() {
     if (closePromise) return closePromise;
     stopped = true;
+    if (activeTurn?.cancellable) activeTurn.controller.abort('bridge_stopped');
     clearTimeout(retryTimer);
     closePromise = Promise.resolve(worker)
       .then(() => replies?.close())
@@ -401,7 +442,7 @@ function createDelivery({
         .get()
     );
   }
-  return { enqueue, close, idle, taskState, retryTask };
+  return { enqueue, close, idle, taskState, retryTask, cancelTask };
 }
 
 module.exports = { buildWecomPrompt, createDelivery };

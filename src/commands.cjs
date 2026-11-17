@@ -8,7 +8,7 @@ function parseCommand(body) {
   if (body.msgtype !== 'text' || typeof body.text?.content !== 'string') return null;
   let text = body.text.content.trim();
   if (body.chattype === 'group') text = text.replace(/^@[^\s]+\s+/, '');
-  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|status|bind|retry|help)(?:\s+([\s\S]*))?$/i.exec(text);
+  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|history|status|bind|retry|cancel|backend|help)(?:\s+([\s\S]*))?$/i.exec(text);
   if (!match) return null;
   const name = match[1].toLowerCase();
   const aliases = { memory: '记忆', forget: '忘记' };
@@ -18,13 +18,16 @@ function parseCommand(body) {
 const helpText = [
   '桥接指令（群里先 @机器人，再输入指令）',
   '/help  查看帮助',
+  '/backend  查看当前后端；/backend codex|claude  切换整个机器人的后端',
   '/status  查看下一条消息的目标和本会话上一条任务',
   '/bind  固定当前目标；/bind <绝对目录>  绑定项目并开启新聊天',
   '/bind off  恢复使用机器人默认目标',
   '/threads  列出工作目录中的聊天',
+  '/history  列出当前后端最近使用的聊天和工作目录（最多 20 条）',
   '/thread <ID 或链接>  切换聊天',
   '/new  新开聊天；/cwd <绝对目录>  换目录并新开聊天',
   '/retry  重试本会话上一条任务中确定失败的环节',
+  '/cancel  取消本会话上一条排队或本地执行中的任务，不撤销已有改动',
   '/memory 或 /记忆  查看记忆；后接内容则保存',
   '/忘记 或 /forget <编号或内容>  删除记忆',
   '绑定后切换目录或聊天只影响本会话。管理指令限机器人绑定的本人使用。',
@@ -38,6 +41,7 @@ function createCommandStore(directory) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS queue_locations (queue_key TEXT PRIMARY KEY, working_dir TEXT NOT NULL, thread_id TEXT);
     CREATE INDEX IF NOT EXISTS queue_by_target ON queue_locations(thread_id,working_dir);
+    CREATE TABLE IF NOT EXISTS target_history (queue_key TEXT PRIMARY KEY, used_order INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS bindings (chat TEXT PRIMARY KEY, target TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS last_tasks (chat TEXT PRIMARY KEY, msg_id TEXT NOT NULL, target TEXT NOT NULL, media TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS notes (
@@ -54,6 +58,10 @@ function createCommandStore(directory) {
     SELECT json_extract(target,'$.queueKey'),json_extract(target,'$.workingDir'),json_extract(target,'$.threadId')
     FROM workers UNION ALL SELECT json_extract(target,'$.queueKey'),json_extract(target,'$.workingDir'),
     json_extract(target,'$.threadId') FROM last_tasks`);
+  // Older versions retained only the last task per chat; their relative age is unknown.
+  db.exec(`INSERT OR IGNORE INTO target_history
+    SELECT json_extract(target,'$.queueKey'),0 FROM last_tasks
+    WHERE json_extract(target,'$.queueKey') IS NOT NULL`);
   const notes = db.prepare('SELECT id,name,body FROM notes WHERE scope=? ORDER BY id');
   function scope(dir, route) {
     const canonical = fs.realpathSync(dir);
@@ -95,8 +103,22 @@ function createCommandStore(directory) {
       else db.prepare('DELETE FROM bindings WHERE chat=?').run(chatKey(route));
     },
     recordTask(route, id, target, media) {
-      db.prepare('INSERT OR REPLACE INTO last_tasks VALUES(?,?,?,?)').run(chatKey(route), id,
-        JSON.stringify(target), JSON.stringify(media));
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('INSERT OR REPLACE INTO last_tasks VALUES(?,?,?,?)').run(chatKey(route), id,
+          JSON.stringify(target), JSON.stringify(media));
+        db.prepare(`INSERT OR REPLACE INTO target_history
+          SELECT ?,COALESCE(MAX(used_order),0)+1 FROM target_history`).run(target.queueKey);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    history(limit = 20) {
+      // Resolve IDs through queue_locations so onCreated also updates existing history.
+      // SQLite's MAX selects queue_key from the most recently used row in each group.
+      return db.prepare(`SELECT q.queue_key AS queueKey,q.thread_id AS threadId,
+        q.working_dir AS workingDir,MAX(h.used_order) AS lastUsed
+        FROM target_history h JOIN queue_locations q USING(queue_key)
+        GROUP BY q.thread_id,q.working_dir ORDER BY lastUsed DESC,q.queue_key LIMIT ?`).all(limit);
     },
     lastTask(route) {
       const row = db.prepare('SELECT msg_id,target,media FROM last_tasks WHERE chat=?').get(chatKey(route));
@@ -112,6 +134,7 @@ function createCommandStore(directory) {
       db.prepare('INSERT INTO received(id,queue_key) VALUES(?,?) ON CONFLICT DO NOTHING').run(id,key);
       return db.prepare('SELECT queue_key,done FROM received WHERE id=?').get(id);
     },
+    handled(id) { return db.prepare('SELECT done FROM received WHERE id=?').get(id)?.done === 1; },
     plan(id, build) {
       db.exec('BEGIN IMMEDIATE');
       try {

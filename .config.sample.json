@@ -1,4 +1,14 @@
 {
-  "threadId": "",
-  "workingDir": ""
+  "backend": "codex",
+  "taskTimeoutMs": 1800000,
+  "backends": {
+    "codex": {
+      "threadId": "",
+      "workingDir": ""
+    },
+    "claude": {
+      "threadId": "",
+      "workingDir": ""
+    }
+  }
 }

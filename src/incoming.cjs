@@ -44,13 +44,16 @@ async function renderContent(content, section, msgId, saveMedia, media) {
 
 // Format a verified SDK callback for display. Callers must make execution/authorization
 // decisions from the SDK sender metadata, never from this human-readable text.
-async function formatIncoming(body, { botId, ownerId, saveMedia } = {}) {
+function isIncoming(body, botId) {
   const sender = body?.from?.userid;
-  if (!hasText(botId) || !hasText(sender) || !hasText(body?.msgid)) return null;
-  if (sender === botId) return null;
-  if (body.chattype !== 'single' && body.chattype !== 'group') return null;
-  if (body.aibotid !== undefined && body.aibotid !== botId) return null;
-  if (body.msgtype === 'event' || body.event?.eventtype) return null;
+  return hasText(botId) && hasText(sender) && hasText(body?.msgid) && sender !== botId &&
+    ['single', 'group'].includes(body.chattype) && (body.aibotid === undefined || body.aibotid === botId) &&
+    body.msgtype !== 'event' && !body.event?.eventtype;
+}
+
+async function formatIncoming(body, { botId, ownerId, saveMedia } = {}) {
+  if (!isIncoming(body, botId)) return null;
+  const sender = body.from.userid;
   const isOwner = sender === ownerId;
   const channel = body.chattype === 'single' ? '单聊' : '群聊';
   const heading = '企微' + channel + ' · ' + (isOwner ? '本人' : '外部用户');
@@ -69,4 +72,4 @@ async function formatIncoming(body, { botId, ownerId, saveMedia } = {}) {
   return { id: body.msgid, text: lines.join('\n'), chatType: body.chattype, route, media };
 }
 
-module.exports = { formatIncoming };
+module.exports = { formatIncoming, isIncoming };

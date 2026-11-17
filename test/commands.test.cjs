@@ -94,6 +94,7 @@ test('verified WS commands switch the live target in order and acknowledge the o
   push('s','/memory 当我说请view时，审查指定 MR，通过后合并');
   push('list','/threads');
   push('list-denied','/threads','guest');
+  push('history-empty','/history');
   push('owner','请view !123');
   push('guest','请view !123','other');
   push('other-chat','请view !123','me','group-B');
@@ -105,6 +106,9 @@ test('verified WS commands switch the live target in order and acknowledge the o
   push('invalid','/thread invalid');
   push('switch','/thread codex://threads/'+second);
   push('last','hello');
+  push('history','/history');
+  push('history-denied','/history','guest');
+  push('history-usage','/history extra');
   await stop('test');
   const by = id => messages.find(m => m.id === id);
   assert.equal(messages.filter(m => m.id === 's').length,1);
@@ -112,6 +116,14 @@ test('verified WS commands switch the live target in order and acknowledge the o
   assert.ok(by('list').text.includes('【当前】当前测试\n' + known));
   assert.ok(by('list').text.includes('未命名聊天\n' + second));
   assert.match(by('list-denied').text,/仅限/);
+  assert.match(by('history-empty').text,/尚无/);
+  assert.equal(by('history').ack, true);
+  assert.match(by('history').text, /【当前】/);
+  assert.ok(by('history').text.indexOf(second) < by('history').text.indexOf(known));
+  assert.ok(by('history').text.includes(secondDir));
+  assert.ok(by('history').text.includes(root));
+  assert.match(by('history-denied').text, /仅限/);
+  assert.match(by('history-usage').text, /用法：\/history/);
   assert.equal(by('s').ack,true);
   assert.equal(by('s').route.chatId,'group-A');
   assert.match(by('owner').text,/通过后合并/);
@@ -134,20 +146,21 @@ test('verified WS commands switch the live target in order and acknowledge the o
   }
   assert.equal(main.loadTarget(backend).workingDir,secondDir);
   assert.equal(main.loadTarget(backend).threadId,second);
-  await main.runBridge({...config,...main.loadTarget(backend)});
   const lastFile = path.join(root, '.state', 'last-target.json');
   const localFile = path.join(root, '.config.local.json');
-  async function deliver(id) {
+  fs.writeFileSync(localFile, JSON.stringify({threadId: known, workingDir: root}));
+  await main.runBridge({...config,...main.loadTarget(backend)});
+  async function deliver(id, content = 'hello') {
     const delivered = new Promise(resolve => {
       waitForEnqueue.set(id, resolve);
     });
-    push(id, 'hello');
+    push(id, content);
     return Promise.race([delivered, new Promise((_, reject) => {
       const timer = setTimeout(() => reject(new Error('Missing delivery ' + id)), 2000);
       timer.unref();
     })]);
   }
-  fs.writeFileSync(localFile, JSON.stringify({threadId: known, workingDir: root}));
+  fs.writeFileSync(localFile, JSON.stringify({threadId: second, workingDir: secondDir}));
   fs.writeFileSync(lastFile, JSON.stringify({threadId: second, workingDir: root}));
   assert.equal((await deliver('same-chat-new-dir')).dir, root);
   fs.writeFileSync(lastFile, JSON.stringify({threadId: second, workingDir: secondDir}));
@@ -156,16 +169,19 @@ test('verified WS commands switch the live target in order and acknowledge the o
   assert.equal((await deliver('removed')).target, known);
   assert.equal(fs.existsSync(lastFile), false);
   fs.writeFileSync(localFile, JSON.stringify({threadId: second}));
-  assert.equal((await deliver('fallback-cwd')).dir, secondDir);
+  assert.equal((await deliver('fallback-cwd')).dir, root);
   fs.writeFileSync(lastFile, '{');
   assert.equal((await deliver('invalid-file')).ack, true);
+  const historyInvalid = await deliver('history-invalid-config', '/history');
+  assert.ok(historyInvalid.text.includes(second));
+  assert.doesNotMatch(historyInvalid.text, /【当前】/);
   fs.writeFileSync(lastFile, JSON.stringify({threadId: known, workingDir: root}));
   assert.equal((await deliver('fixed')).target, known);
   fs.unlinkSync(lastFile);
   fs.unlinkSync(localFile);
   const empty = await deliver('no-files');
-  assert.equal(empty.target, undefined);
-  assert.equal(empty.dir, process.cwd());
+  assert.equal(empty.target, known);
+  assert.equal(empty.dir, root);
   assert.equal((await deliver('pending')).key, empty.key);
   push('fresh','/new');
   await stop('test');

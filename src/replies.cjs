@@ -102,7 +102,12 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     sql.run`UPDATE bridge_replies SET queue_id=${id} WHERE entry=${entry}`;
   }
   function unmatched(entry, reason = missingReceiptReason, message) {
-    const description = message || (reason === 'turn_failed'
+    const stopped = {
+      task_cancelled: '已取消本次任务的本地执行。已产生的改动不会撤销，桥接不会自动重跑。',
+      task_timeout: '本次任务执行超时，已停止本地进程。任务可能已产生部分改动，桥接不会自动重跑。',
+      bridge_stopped: '桥接停止时中断了本次任务。任务可能已产生部分改动，重启后不会自动重跑。',
+    };
+    const description = message || stopped[reason] || (['turn_failed', 'claude_turn_failed'].includes(reason)
       ? '处理程序报告任务失败，任务可能已产生部分改动。请查看目标聊天后决定是否重试。'
       : '桥接无法确认本次任务的结果，暂未取得可回发的答复。任务可能已开始，请查看目标聊天，避免重复执行。');
     const token = tokenFor(entry);

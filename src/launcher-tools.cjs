@@ -65,6 +65,61 @@ async function resolveCodex() {
   throw new Error('No Codex CLI supporting exec resume --json with stdin and queue --thread --message --resume was found. Update Codex desktop or set CODEX_CLI_PATH.');
 }
 
+// All Claude launches use execFile/spawn with shell:false. A Windows npm shim
+// resolves to Node plus its real JS entry, never to a .cmd or PowerShell process.
+async function claudeCommand(file) {
+  if (!path.isAbsolute(file) || !await isFile(file)) return undefined;
+  if (/\.(?:cmd|ps1)$/i.test(file)) {
+    const packageRoot = path.join(path.dirname(file), 'node_modules', '@anthropic-ai', 'claude-code');
+    try {
+      const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, 'package.json'), 'utf8'));
+      const bin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.claude;
+      if (manifest.name !== '@anthropic-ai/claude-code' || typeof bin !== 'string') return undefined;
+      const entry = path.resolve(packageRoot, bin);
+      if (await isFile(entry)) return { file: process.execPath, prefix: [entry] };
+    } catch { /* The next PATH entry may contain a valid installation. */ }
+    return undefined;
+  }
+  return /\.(?:[cm]?js)$/i.test(file)
+    ? { file: process.execPath, prefix: [file] }
+    : { file, prefix: [] };
+}
+
+async function checkClaude(cli) {
+  const options = { ...executionOptions, shell: false };
+  let help;
+  try {
+    const { stdout, stderr } = await execute(cli.file, [...cli.prefix, '--help'], options);
+    help = stdout + stderr;
+  } catch { throw new Error('无法运行 Claude CLI --help，请检查 CLAUDE_CLI_PATH 或 PATH。'); }
+  const required = ['--print', '--output-format', '--verbose', '--resume', '--permission-prompts'];
+  const missing = required.filter(flag => !new RegExp(flag + '(?=[\\s,=<>\\[\\]]|$)').test(help));
+  if (missing.length) throw new Error('Claude CLI 缺少桥接所需参数：' + missing.join(', ') + '。请更新 Claude Code。');
+  try {
+    const { stdout } = await execute(cli.file, [...cli.prefix, 'auth', 'status'], options);
+    const status = JSON.parse(stdout.trim());
+    if (status.loggedIn !== true) throw new Error('not logged in');
+  } catch { throw new Error('Claude CLI 尚未登录或无法核对授权，请运行 claude auth status 并使用 claude auth login 登录。'); }
+  return cli;
+}
+
+async function resolveClaude() {
+  const explicit = process.env.CLAUDE_CLI_PATH?.trim().replace(/^"(.*)"$/, '$1');
+  if (explicit) {
+    const cli = await claudeCommand(explicit);
+    if (!cli) throw new Error('CLAUDE_CLI_PATH 必须是 Claude CLI 的绝对文件路径（可使用 npm shim 或真实 JS 入口）。');
+    return checkClaude(cli);
+  }
+  for (const directory of pathDirectories()) {
+    const names = process.platform === 'win32' ? ['claude.exe', 'claude.cmd', 'claude.ps1'] : ['claude'];
+    for (const name of names) {
+      const cli = await claudeCommand(path.resolve(directory, name));
+      if (cli) return checkClaude(cli);
+    }
+  }
+  throw new Error('未找到 Claude CLI。请将 claude 加入 PATH，或设置 CLAUDE_CLI_PATH 为绝对路径。');
+}
+
 async function resolveWecom() {
   for (const directory of pathDirectories()) {
     if (process.platform !== 'win32') {
@@ -127,4 +182,4 @@ async function readIdentity() {
   return { botId, ownerId };
 }
 
-module.exports = { resolveCodex, readIdentity, resolveWecom };
+module.exports = { resolveCodex, resolveClaude, readIdentity, resolveWecom };

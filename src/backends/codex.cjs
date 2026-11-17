@@ -5,6 +5,7 @@ const { readFileSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { createInterface } = require("node:readline");
 const { createDiagnostics } = require("./cli-diagnostics.cjs");
+const { taskTimeout, processOptions, watchProcess } = require('../process-lifecycle.cjs');
 const { createReplyReader, listThreads, readThread, readThreadCwd, queueMessage } = require("./codex-history.cjs");
 
 const retryableLaunchErrors = new Set([
@@ -98,8 +99,11 @@ function externalArgs(workingDir) {
     "--ignore-user-config", "--ignore-rules", "-C", workingDir];
 }
 
-function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, onDiagnostic, replyToken }, outputFile, external, enqueue) {
+function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, onDiagnostic, onDetached, replyToken, signal, timeoutMs }, outputFile, external, enqueue) {
+  timeoutMs = taskTimeout(timeoutMs);
+  if (signal?.aborted) return Promise.resolve({ state: 'uncertain', reason: 'task_cancelled' });
   const diagnostics = createDiagnostics("exec", prompt, onDiagnostic);
+  const startedAt = performance.now();
   const args = external ? externalArgs(workingDir) : ["exec", "-c", "sandbox_workspace_write.network_access=true", "-C", workingDir];
   if (threadId) args.push("resume");
   args.push("--json", "--skip-git-repo-check");
@@ -107,6 +111,7 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
   if (threadId) args.push(threadId);
   args.push("-");
   const options = {
+    ...processOptions,
     shell: false,
     windowsHide: true,
     env: childEnvironment(external),
@@ -139,6 +144,7 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
       inputFailed = true;
       diagnostics.error(error.message);
     });
+    const lifecycle = watchProcess(child, { signal, timeoutMs });
     createInterface({ input: child.stderr, crlfDelay: Infinity }).on(
       "line",
       (line) => {
@@ -199,9 +205,12 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
       },
     );
     child.once("close", (code, signal) => {
-      diagnostics.report(code, signal, launchError);
+      diagnostics.report(code, signal, launchError, { elapsedMs: Math.round(performance.now() - startedAt),
+        ...(lifecycle.reason && { stopReason: lifecycle.reason }) });
+      if (lifecycle.reason) return resolve({ state: 'uncertain', reason: lifecycle.reason });
       if (launchError) return resolve(launchFailure(child, launchError));
       if (!external && code === 1 && activeWriter && !sawEvent && !inputFailed) {
+        onDetached?.();
         return resolve(
           enqueue({ codexPath, workingDir, threadId, prompt, replyToken, execute, onDiagnostic }),
         );
@@ -254,6 +263,7 @@ function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestD
   return {
     id: "codex",
     name: "Codex",
+    supportsCancellation: true,
     missingReceiptReason: "missing_codex_receipt",
     eventMessages: {
       delivery_queued_in_codex: "消息已进入目标 Codex 聊天的队列。",

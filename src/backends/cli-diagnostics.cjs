@@ -26,11 +26,11 @@ function createDiagnostics(command, prompt, onDiagnostic = () => {}) {
   return {
     capture(chunk) { stderr = (stderr + chunk).slice(-8192); },
     error(message) { if (typeof message === 'string') structuredError = redact(message).slice(0, 1200); },
-    report(exitCode, signal, error) {
+    report(exitCode, signal, error, details = {}) {
       const summary = redact(error?.message || structuredError || stderr)
         .split(/\r?\n/).filter(line => line.trim()).slice(-4).join(' | ').slice(0, 1200);
       try {
-        onDiagnostic({ command, exitCode: exitCode ?? null, signal: signal ?? null,
+        onDiagnostic({ ...details, command, exitCode: exitCode ?? null, signal: signal ?? null,
           ...(error?.code && { errorCode: error.code }), ...(summary && { errorSummary: summary }) });
       } catch { /* Diagnostics must not change delivery or cause duplicate execution. */ }
     },
