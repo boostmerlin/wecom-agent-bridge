@@ -7,8 +7,15 @@
 准备好以下环境：
 
 - Windows、macOS 或 Linux，Node.js 24 或以上。
-- 本机可用的 Codex CLI，支持 `exec resume --json` 和 app-server 的 `thread/queue/add`。如果启动器找不到可执行文件，将 `CODEX_CLI_PATH` 设为它的绝对路径。
-- 已开启长连接的企业微信智能机器人、该机器人的长连接 Secret，以及已授权的 `wecom-cli`。用 `wecom-cli identity whoami` 核对身份。
+- 本机安装所选后端的 CLI：默认使用 Codex，也可[使用 Claude Code](#使用-claude-code)。版本要求见下表。如果启动器找不到可执行文件，将 `CODEX_CLI_PATH` 或 `CLAUDE_CLI_PATH` 设为对应 CLI 的绝对路径。
+- 已开启长连接的企业微信智能机器人、该机器人的长连接 Secret，以及已授权的 `wecom-cli`（参阅 [wecom-cli 官方安装与授权配置文档](https://github.com/WecomTeam/wecom-cli#快速开始)）。用 `wecom-cli identity whoami` 核对身份。
+
+| 后端 | 最低参数版本 | 所需能力 | 已验证参数能力的版本 |
+| --- | --- | --- | --- |
+| Codex | **0.166.0** | `exec resume --json`、app-server 的 `thread/queue/add`，以及启动器检查的 `queue --thread --message --resume` | `0.169.0-alpha.11.1`（桌面版内置 CLI） |
+| Claude Code | **2.1.259** | `--print`、`--output-format stream-json`、`--verbose`、`--resume`、`--permission-prompts none` 和 `auth status` | `2.1.325` |
+
+最低参数版本依据官方发布记录：[Codex 0.166.0](https://github.com/openai/codex/releases/tag/rust-v0.166.0) 增加了 `queue --resume`；[Claude Code 2.1.259](https://github.com/anthropics/claude-code/releases/tag/v2.1.259) 增加了 `--permission-prompts none`。这不代表所有旧版本均经过完整联调；Codex 的队列 API 仍属于实验性接口。启动器会检查所需 CLI 参数，部署时仍需运行下面的检查及消息回发验证。两个后端使用各自的命令和协议，不能互换 CLI 参数。
 
 在仓库目录运行：
 
@@ -24,7 +31,7 @@ node start.cjs
 
 ## 使用 Claude Code
 
-本机安装并登录 Claude Code，要求支持 `--print`、`--output-format stream-json`、`--resume` 和 `--permission-prompts none`。本次接入以 Claude Code 2.1.325 验证参数能力。启动器会检查所选 CLI、Claude 登录状态、企微身份和目标目录；选择 Claude 时无需安装 Codex。如果找不到 CLI，可将 `CLAUDE_CLI_PATH` 设为可执行文件的绝对路径。
+本机安装并登录 **Claude Code 2.1.259 或以上版本**，所需能力与验证版本见上表。启动器会检查所选 CLI、Claude 登录状态、企微身份和目标目录；选择 Claude 时无需安装 Codex。如果找不到 CLI，可将 `CLAUDE_CLI_PATH` 设为可执行文件的绝对路径。
 
 在 `.config.local.json` 中选择后端，并按后端保存初始目标：
 
