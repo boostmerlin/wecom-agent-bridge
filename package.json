@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node start.cjs",
     "test": "node --test",
+    "test:codex:smoke": "node --test scripts/codex-smoke.cjs",
     "test:claude:smoke": "node --test scripts/claude-smoke.cjs"
   },
   "dependencies": {

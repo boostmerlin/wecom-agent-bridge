@@ -34,6 +34,8 @@ const eventMessages = {
   delivery_uncertain: '无法确认投递结果，请查看目标聊天。',
   delivery_storage_error: '读写本地投递队列时出错。',
   cli_exited: 'CLI 进程已退出。',
+  approval_requested: '操作正在等待本人审批。',
+  approval_resolved: '本次操作的审批已结束。',
   cli_warning: 'CLI 报告会话保存异常；已生成的答复仍会回发，请检查磁盘空间和会话记录。',
   reply_no_route: '企微回调未提供原会话 ID，无法回发。',
   reply_waiting: '正在等待这条企微消息对应的最终答复。',
@@ -46,7 +48,7 @@ const eventMessages = {
   reply_storage_error: '读写本地回发记录时出错。',
 };
 
-async function createBackendRuntime({ config, backend, initialTarget, defaults, client, sendReply, onError }) {
+async function createBackendRuntime({ config, backend, initialTarget, defaults, client, sendReply, onError, requestApproval }) {
   const { taskTimeoutMs } = config;
   let active, commands;
   const workers = new Map();
@@ -92,7 +94,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
       current.delivery = createDelivery({
         ...snapshot(), backend, ownerId: config.ownerId, stateDir: inbox, sendReply,
         progressAfterMs: config.progressAfterMs,
-        taskTimeoutMs,
+        taskTimeoutMs, requestApproval,
         progressText: async route => {
           const title = route.senderId === config.ownerId ? await chatTitle(backend, current.threadId) : backend.name;
           return '已投递到 ' + title + '，完成后会在这里回复。';
@@ -192,7 +194,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
       const cmd = parseCommand(frame.body);
       const requestId = frame.headers?.req_id;
       const repairingBinding = cmd?.name === 'bind' && !!cmd.arg;
-      if (targetError && !repairingBinding && !['help', 'history', 'status', 'retry', 'cancel', 'backend'].includes(cmd?.name)) {
+      if (targetError && !repairingBinding && !['help', 'history', 'status', 'retry', 'cancel', 'backend', 'approve', 'deny'].includes(cmd?.name)) {
         if (route) origin.delivery.enqueue(message.id, targetError,
           message.chatType, route, requestId, frame.body.from.userid, true);
         commands.finish(message.id);

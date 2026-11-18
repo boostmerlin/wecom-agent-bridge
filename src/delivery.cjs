@@ -7,6 +7,11 @@ const { DatabaseSync } = require("node:sqlite");
 const { createReplies } = require("./replies.cjs");
 const { taskTimeout } = require('./process-lifecycle.cjs');
 
+const rejectionNotices = {
+  external_sandbox_unsupported: '当前后端暂不支持其他人的任务，本条消息未执行。请由机器人绑定的本人发送任务。',
+  thread_busy: '目标 Codex 聊天被其他进程占用，本次消息未投递。请释放该聊天后发送 /retry；也可用 /new 新建聊天，再重新发送任务。',
+};
+
 function buildWecomPrompt(text) {
   return (
     text +
@@ -22,7 +27,7 @@ function createDelivery({
   stateDir,
   log = () => {},
   readReplies = backend?.readReplies && (keys => backend.readReplies({ threadId, workingDir }, keys)),
-  sendReply, progressText, progressAfterMs, taskTimeoutMs,
+  sendReply, progressText, progressAfterMs, taskTimeoutMs, requestApproval,
   queueKey = threadId,
   onCreated,
 }) {
@@ -217,6 +222,10 @@ function createDelivery({
         };
         if (owner) result = await backend.submit({
           ...turn, threadId, autoCreated: queueKey !== threadId,
+          onApproval: requestApproval && replies ? details => {
+            const route = db.prepare('SELECT chat_type AS chatType,chat_id AS chatId,sender_id AS senderId FROM bridge_replies WHERE entry=?').get(message.id);
+            return requestApproval({ ...details, route, backend: backend.id, requestId: token });
+          } : undefined,
           onCreated(id) {
             threadId = pendingBinding = id;
             db.prepare("INSERT INTO bridge_target(id,thread_id) VALUES(1,?)").run(id);
@@ -243,9 +252,7 @@ function createDelivery({
           if (result.state === "completed" && result.text?.trim()) replies.ready(message.id, result.text);
           else if (result.queueId && readReplies) replies.start(message.id);
           else if (result.state === "rejected") replies.unmatched(message.id, result.reason || "delivery_rejected",
-            result.reason === 'external_sandbox_unsupported'
-              ? '当前后端暂不支持其他人的任务，本条消息未执行。请由机器人绑定的本人发送任务。'
-              : "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
+            rejectionNotices[result.reason] || "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
           else replies.unmatched(message.id, result.reason);
         }
         db.exec("COMMIT");

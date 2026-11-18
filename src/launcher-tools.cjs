@@ -92,7 +92,7 @@ async function checkClaude(cli) {
     const { stdout, stderr } = await execute(cli.file, [...cli.prefix, '--help'], options);
     help = stdout + stderr;
   } catch { throw new Error('无法运行 Claude CLI --help，请检查 CLAUDE_CLI_PATH 或 PATH。'); }
-  const required = ['--print', '--output-format', '--verbose', '--resume', '--permission-prompts'];
+  const required = ['--print', '--output-format', '--verbose', '--resume', '--permission-mode', '--permission-prompts'];
   const missing = required.filter(flag => !new RegExp(flag + '(?=[\\s,=<>\\[\\]]|$)').test(help));
   if (missing.length) throw new Error('Claude CLI 缺少桥接所需参数：' + missing.join(', ') + '。请更新 Claude Code。');
   try {

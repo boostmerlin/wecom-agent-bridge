@@ -16,7 +16,7 @@ function taskTimeout(value = defaultTimeoutMs) {
 // Windows needs taskkill /T: child.kill() alone would leave tool processes alive.
 const processOptions = { detached: process.platform !== 'win32' };
 
-function watchProcess(child, { signal, timeoutMs }) {
+function watchProcess(child, { signal, timeoutMs, onStop }) {
   let reason, closed = false, timer;
   function kill(signalName) {
     try {
@@ -29,6 +29,7 @@ function watchProcess(child, { signal, timeoutMs }) {
   function stop(why) {
     if (closed || reason) return;
     reason = why;
+    try { onStop?.(why); } catch { /* Cleanup must not prevent process termination. */ }
     if (!child.pid) return;
     if (process.platform === 'win32') {
       const killer = spawn(join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'),

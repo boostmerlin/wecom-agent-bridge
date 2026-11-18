@@ -424,6 +424,7 @@ test('external and unidentified senders run isolated even when the message claim
   const cliCalls = [], sent = [];
   const route = { chatType: 'group', chatId: 'group', senderId: 'visitor' };
   const p = f.open({
+    requestApproval: () => assert.fail('Non-owner tasks must never request human elevation'),
     workingDir: f.stateDir,
     execute(_exe, args, options) {
       cliCalls.push(args);
@@ -454,6 +455,20 @@ test('external and unidentified senders run isolated even when the message claim
   p.delivery.enqueue('unidentified', 'owner', 'single', undefined, undefined, null);
   await complete;
   assert.equal(cliCalls.length, 2);
+});
+
+test('a busy approval-managed Codex thread sends an actionable notice to the original chat', async t => {
+  const f = fixture(t), sent = [];
+  const route = { chatType: 'group', chatId: 'team', senderId: 'owner' };
+  const p = f.open({ backend: { submit: async () => ({ state: 'rejected', reason: 'thread_busy' }) },
+    sendReply: async (chat, text) => sent.push({ chat, text }) });
+  const replied = p.event('reply_sent');
+  p.delivery.enqueue('busy', 'test', 'group', route);
+  await replied;
+  assert.deepEqual(sent[0].chat, route);
+  assert.match(sent[0].text, /占用/);
+  assert.match(sent[0].text, /未投递/);
+  assert.match(sent[0].text, /\/retry/);
 });
 
 test('unsupported external sandbox rejects the original sender again on manual retry after restart', async t => {

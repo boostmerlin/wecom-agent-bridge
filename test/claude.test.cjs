@@ -58,16 +58,39 @@ test('Claude creates and resumes the exact session, sending UTF-8 by stdin and o
   assert.deepEqual(await f.backend.submit(f.turn), { state: 'completed', text: '最终答复 😀' });
   assert.deepEqual(f.callbacks, [['created', id], ['started']]);
   assert.equal(f.calls[0].file, 'fixture-claude');
-  assert.deepEqual(f.calls[0].args, ['--print', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none']);
+  const ownerArgs = ['--print', '--output-format', 'stream-json', '--verbose',
+    '--permission-mode', 'bypassPermissions', '--permission-prompts', 'none'];
+  assert.deepEqual(f.calls[0].args, ownerArgs);
   assert.equal(f.calls[0].options.cwd, f.root);
   assert.equal(f.calls[0].options.shell, false);
   assert.equal(f.calls[0].options.windowsHide, true);
   assert.equal(f.diagnostics[0].exitCode, 0);
   f.callbacks.length = 0;
   assert.equal((await f.backend.submit({ ...f.turn, threadId: id })).state, 'completed');
-  assert.deepEqual(f.calls[1].args.slice(-2), ['--resume', id]);
+  assert.deepEqual(f.calls[1].args, [...ownerArgs, '--resume', id]);
   assert.deepEqual(f.callbacks, [['started']]);
-  assert.equal(f.backend.submitExternal, undefined);
+});
+
+test('non-owner Claude tasks use auto in fresh non-persistent sessions without owner approvals', async t => {
+  const f = fixture(t, root => ({ prompt, events: [init(root), final()] }));
+  const turn = { ...f.turn, threadId: other,
+    onCreated: () => assert.fail('External sessions must not replace the owner target'),
+    onApproval: () => assert.fail('External tasks must not request owner approval') };
+  for (let i = 0; i < 2; i++) assert.deepEqual(await f.backend.submitExternal(turn), { state: 'completed', text: '最终答复 😀' });
+  for (const { args, options } of f.calls) {
+    assert.equal(args[args.indexOf('--permission-mode') + 1], 'auto');
+    assert.equal(args[args.indexOf('--permission-prompts') + 1], 'none');
+    assert.ok(args.includes('--no-session-persistence'));
+    assert.ok(!args.includes('--resume') && !args.includes('--settings') && !args.includes('bypassPermissions'));
+    assert.equal(options.cwd, f.root);
+  }
+  assert.deepEqual(f.callbacks, [['started'], ['started']]);
+});
+
+test('non-owner policy denials still return the final explanation', async t => {
+  const f = fixture(t, root => ({ prompt, events: [init(root), { ...final('权限拒绝，未执行。'), permission_denials: [{ tool_name: 'Bash' }] }] }));
+  assert.deepEqual(await f.backend.submitExternal(f.turn), { state: 'completed', text: '权限拒绝，未执行。' });
+  assert.equal(f.diagnostics[0].permissionDenials.count, 1);
 });
 
 test('Claude supports launcher executable prefixes for Windows npm installations', async t => {
@@ -75,6 +98,75 @@ test('Claude supports launcher executable prefixes for Windows npm installations
   assert.equal((await f.backend.submit(f.turn)).state, 'completed');
   assert.equal(f.calls[0].file, process.execPath);
   assert.equal(f.calls[0].args[0], 'C:/CLI path/cli.js');
+});
+
+test('Claude pauses a tool for host approval and closes the hook after the turn', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-approval-cli-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let hook, asked = 0;
+  const backend = createClaudeBackend({ claudePath: 'fixture', execute(file, args, options) {
+    const index = args.indexOf('--settings');
+    assert.ok(index >= 0, 'CLI must receive a PermissionRequest hook');
+    hook = JSON.parse(args[index + 1]).hooks.PermissionRequest[0].hooks[0];
+    return spawn(process.execPath, ['-e', `
+      process.stdin.resume();
+      process.stdin.on('end', async () => {
+        const hook = JSON.parse(process.env.FIXTURE_HOOK);
+        const session = '${id}';
+        console.log(JSON.stringify({type:'system',subtype:'init',session_id:session,cwd:process.cwd()}));
+        const response = await fetch(hook.url, {method:'POST',headers:hook.headers,
+          body:JSON.stringify({hook_event_name:'PermissionRequest',session_id:session,cwd:process.cwd(),tool_name:'Bash',tool_input:{command:'git push'}})});
+        const result = await response.json();
+        console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:session,result:result.hookSpecificOutput.decision.behavior}));
+      });
+    `], { ...options, env: { ...options.env, FIXTURE_HOOK: JSON.stringify(hook) } });
+  } });
+  const result = await backend.submit({ workingDir: root, prompt: 'test', onCreated() {}, onStarted() {},
+    onApproval: async request => {
+      asked++;
+      assert.equal(request.toolName, 'Bash');
+      assert.deepEqual(request.input, { command: 'git push' });
+      return { behavior: 'allow' };
+    } });
+  assert.deepEqual(result, { state: 'completed', text: 'allow' });
+  assert.equal(asked, 1);
+  await assert.rejects(fetch(hook.url));
+});
+
+test('Claude timeout revokes approval while the child is still shutting down', { timeout: 5000 }, async t => {
+  const { EventEmitter } = require('node:events');
+  const { PassThrough } = require('node:stream');
+  const child = new EventEmitter();
+  Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+  let hook, approval, release, ready;
+  const initialized = new Promise(resolve => { ready = resolve; });
+  let received;
+  const requested = new Promise(resolve => { received = resolve; });
+  const backend = createClaudeBackend({ claudePath: 'fixture', execute(_file, args) {
+    hook = JSON.parse(args[args.indexOf('--settings') + 1]).hooks.PermissionRequest[0].hooks[0];
+    queueMicrotask(() => child.stdout.write(JSON.stringify(init(__dirname)) + '\n'));
+    return child;
+  } });
+  const pending = backend.submit({ workingDir: __dirname, threadId: id, prompt: 'test', timeoutMs: 300,
+    onStarted: ready, onApproval: request => {
+      approval = request; received();
+      return new Promise(resolve => { release = resolve; });
+    } });
+  t.after(async () => {
+    release?.({ behavior: 'deny' });
+    child.emit('close', null, 'SIGKILL');
+    child.stdout.end(); child.stderr.end();
+    await pending;
+  });
+  await initialized;
+  const response = fetch(hook.url, { method: 'POST', headers: hook.headers,
+    body: JSON.stringify({ hook_event_name: 'PermissionRequest', session_id: id, cwd: __dirname,
+      tool_name: 'Bash', tool_input: { command: 'echo test' } }) }).then(r => r.json()).catch(() => null);
+  await requested;
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(approval.signal.aborted, true, 'Approval survived timeout until process close');
+  release({ behavior: 'allow' });
+  assert.notEqual((await response)?.hookSpecificOutput?.decision?.behavior, 'allow');
 });
 
 test('Claude never retries a missing, failed, mismatched or malformed result after execution may have begun', async t => {
@@ -115,10 +207,11 @@ test('only confirmed pre-session startup failures are rejected and launch failur
   }
 });
 
-test('permission denials return Claude final explanation without granting permissions or waiting for an approval', async t => {
+test('remaining policy denials return Claude final explanation without retrying or waiting for an approval', async t => {
   const f = fixture(t, root => ({ prompt, events: [init(root), { ...final('命令未执行：权限不足。'), permission_denials: [{ tool_name: 'Bash' }] }] }));
   assert.deepEqual(await f.backend.submit(f.turn), { state: 'completed', text: '命令未执行：权限不足。' });
-  assert.ok(!f.calls[0].args.includes('--dangerously-skip-permissions'));
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].args[f.calls[0].args.indexOf('--permission-mode') + 1], 'bypassPermissions');
 });
 
 test('session metadata uses the official local SDK with exact directory filtering and archived sessions excluded', async () => {

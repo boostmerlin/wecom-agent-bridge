@@ -5,6 +5,7 @@ const { readFileSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { createInterface } = require("node:readline");
 const { createDiagnostics } = require("./cli-diagnostics.cjs");
+const { runCodexSession } = require('./codex-session.cjs');
 const { taskTimeout, processOptions, watchProcess } = require('../process-lifecycle.cjs');
 const { createReplyReader, listThreads, readThread, readThreadCwd, queueMessage } = require("./codex-history.cjs");
 
@@ -248,6 +249,7 @@ function parseThreadId(value) {
 function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestDesktopWake, enqueue = queueMessage }) {
   if (typeof codexPath !== "string" || !codexPath.trim()) throw new Error("Missing Codex executable");
   async function submitTurn(turn, external) {
+    if (!external && turn.onApproval) return runCodexSession(execute, codexPath, turn, childEnvironment(true));
     const outputFile = turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
     try {
       const result = await runTurn(execute, codexPath, turn, outputFile, external, enqueue);

@@ -10,6 +10,7 @@ const { isIncoming } = require('./incoming.cjs');
 const { createBackendRuntime } = require('./backend-runtime.cjs');
 const { createMessageRouting } = require('./message-routing.cjs');
 const { taskTimeout } = require('./process-lifecycle.cjs');
+const { createApprovals } = require('./approvals.cjs');
 const targets = require('./target-config.cjs');
 
 async function runBridge(config) {
@@ -18,7 +19,7 @@ async function runBridge(config) {
   const defaults = targets.readSettings(path.join(targets.root, '.config.local.json'));
   config.taskTimeoutMs = taskTimeout(config.taskTimeoutMs === undefined ? defaults.taskTimeoutMs : config.taskTimeoutMs);
   const runtimes = new Map();
-  let active, client, control, routing, stopping = false;
+  let active, client, control, routing, approvals, stopping = false;
   let connection = 'connecting', receiving = Promise.resolve();
   const log = (event, details) => active?.log(event, details);
   const onError = () => { log('receive_error'); void stop('receive_error', 1); };
@@ -30,6 +31,7 @@ async function runBridge(config) {
     stopping = true;
     connection = 'stopping';
     client?.disconnect();
+    approvals?.close();
     try {
       await receiving;
       await Promise.all([...runtimes.values()].map(runtime => runtime.close()));
@@ -53,6 +55,8 @@ async function runBridge(config) {
     });
     delete config.secret;
     const sendReply = createWecomSender({ botId: config.botId, ownerId: config.ownerId });
+    approvals = createApprovals({ ownerId: config.ownerId, sendReply,
+      log: (event, details) => runtimes.get(details.backend)?.log(event, details, details) });
     const botKey = createHash('sha256').update(config.botId).digest('hex').slice(0, 16);
     const legacySources = [...new Set(['codex', 'claude', config.backend.id])].map(id => ({
       backend: id,
@@ -60,7 +64,8 @@ async function runBridge(config) {
     }));
     routing = createMessageRouting(path.join(targets.root, '.state', 'routing', botKey), legacySources);
     async function open(backend, initialTarget) {
-      const runtime = await createBackendRuntime({ config, backend, initialTarget, defaults, client, sendReply, onError });
+      const runtime = await createBackendRuntime({ config, backend, initialTarget, defaults, client, sendReply, onError,
+        requestApproval: details => approvals.request(details) });
       runtimes.set(backend.id, runtime);
       return runtime;
     }
@@ -90,6 +95,11 @@ async function runBridge(config) {
         const cmd = parseCommand(body);
         const hasRoute = body.chattype === 'single' || (typeof body.chatid === 'string' && body.chatid.trim());
         let reply, selected;
+        if (['approve', 'deny'].includes(cmd?.name) && hasRoute) {
+          reply = approvals.respond({ chatType: body.chattype,
+            chatId: body.chattype === 'group' ? body.chatid : body.from.userid,
+            senderId: body.from.userid }, cmd.name, cmd.arg);
+        }
         if (cmd?.name === 'backend' && hasRoute) {
           const requested = cmd.arg.toLowerCase();
           if (body.from.userid !== config.ownerId) reply = '此指令仅限机器人绑定的本人使用。';

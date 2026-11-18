@@ -6,6 +6,16 @@ const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { processOptions, watchProcess } = require('../src/process-lifecycle.cjs');
 
+test('timeout invalidates pending interactions before the child close event', async () => {
+  const child = new (require('node:events').EventEmitter)();
+  let stopped;
+  const lifecycle = watchProcess(child, { timeoutMs: 5, onStop: reason => { stopped = reason; } });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(stopped, 'task_timeout');
+  assert.equal(lifecycle.reason, 'task_timeout');
+  child.emit('close');
+});
+
 test('cancellation terminates a CLI and its tool child, including tools ignoring SIGTERM', { timeout: 10000 }, async t => {
   const controller = new AbortController();
   const child = spawn(process.execPath, ['-e', `

@@ -132,7 +132,7 @@ function launcher(env, reply, platform = process.platform) {
   });
   return { ...module.exports, calls };
 }
-const help = '--print --output-format <format> --verbose --resume [id] --permission-prompts <mode>';
+const help = '--print --output-format <format> --verbose --resume [id] --permission-mode <mode> --permission-prompts <mode>';
 function success(_file, args) {
   return { stdout: args.at(-1) === '--help' ? help : '{"loggedIn":true}', stderr: '' };
 }

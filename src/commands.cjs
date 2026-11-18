@@ -8,10 +8,12 @@ function parseCommand(body) {
   if (body.msgtype !== 'text' || typeof body.text?.content !== 'string') return null;
   let text = body.text.content.trim();
   if (body.chattype === 'group') text = text.replace(/^@[^\s]+\s+/, '');
-  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|history|status|bind|retry|cancel|backend|help)(?:\s+([\s\S]*))?$/i.exec(text);
+  const decision = /^\/?(允许|拒绝|approve|deny)(?:\s+([a-z0-9]+))?$/i.exec(text);
+  if (decision) return { name: /^(允许|approve)$/i.test(decision[1]) ? 'approve' : 'deny', arg: decision[2] || '' };
+  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|history|status|bind|retry|cancel|backend|help|允许|拒绝|approve|deny)(?:\s+([\s\S]*))?$/i.exec(text);
   if (!match) return null;
   const name = match[1].toLowerCase();
-  const aliases = { memory: '记忆', forget: '忘记' };
+  const aliases = { memory: '记忆', forget: '忘记', 允许: 'approve', 拒绝: 'deny' };
   return { name: aliases[name] ?? name, arg: (match[2] || '').trim() };
 }
 
@@ -28,6 +30,7 @@ const helpText = [
   '/new  新开聊天；/cwd <绝对目录>  换目录并新开聊天',
   '/retry  重试本会话上一条任务中确定失败的环节',
   '/cancel  取消本会话上一条排队或本地执行中的任务，不撤销已有改动',
+  '允许 <审批编号> / 拒绝 <审批编号>  回应 Codex / Claude 审批；只有一条待审批时可省略编号',
   '/memory 或 /记忆  查看记忆；后接内容则保存',
   '/忘记 或 /forget <编号或内容>  删除记忆',
   '绑定后切换目录或聊天只影响本会话。管理指令限机器人绑定的本人使用。',
