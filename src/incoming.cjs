@@ -8,6 +8,30 @@ function hasText(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function titleFromPreview(preview) {
+  if (!hasText(preview)) return;
+  let body = preview.trim();
+  const heading = /^企微(?:单聊|群聊) · (本人|外部用户)(?:\s+|$)/.exec(body);
+  if (heading) {
+    // The SDK can flatten the message and its section headings onto a single line.
+    body = body.slice(heading[0].length).split(/(?:^|\s)(?:&nbsp;\s+)?\*\*(?:约定|特殊要求|引用)\*\*/, 1)[0];
+    if (heading[1] === '外部用户') {
+      const quote = /(?:^|\s)>[ \t]+/.exec(body);
+      if (!quote) return;
+      body = body.slice(quote.index + quote[0].length);
+    } else if (body.startsWith('**正文**')) {
+      body = body.slice('**正文**'.length);
+    } else {
+      // Older messages separated the body from the instructions with a blank line.
+      body = body.split(/ {2,}/, 1)[0];
+    }
+  }
+  const first = body.trim().split(/\r?\n/, 1)[0].trim();
+  if (!first) return;
+  const chars = [...first];
+  return chars.length <= 80 ? first : chars.slice(0, 80).join('') + '…';
+}
+
 async function renderPart(item, part, msgId, saveMedia, media) {
   const kind = item?.msgtype;
   if (kind === 'text') return hasText(item.text?.content) ? item.text.content : '［空文本消息］';
@@ -72,4 +96,4 @@ async function formatIncoming(body, { botId, ownerId, saveMedia } = {}) {
   return { id: body.msgid, text: lines.join('\n'), chatType: body.chattype, route, media };
 }
 
-module.exports = { formatIncoming, isIncoming };
+module.exports = { formatIncoming, isIncoming, titleFromPreview };

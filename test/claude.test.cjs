@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createClaudeBackend, parseThreadId } = require('../src/backends/claude.cjs');
+const { chatTitle } = require('../src/task-status.cjs');
 
 const id = '01234567-89ab-4def-8123-0123456789ab';
 const other = '11234567-89ab-4def-8123-0123456789ab';
@@ -235,6 +236,27 @@ test('session metadata uses the official local SDK with exact directory filterin
   await assert.rejects(backend.getWorkingDir(other), /工作目录/);
   for (const value of ['', null, '../bad', 'codex://threads/' + id]) assert.throws(() => parseThreadId(value));
   assert.equal(parseThreadId(id.toUpperCase()), id);
+});
+
+test('Claude status and thread lists show a title or a short body excerpt, including flattened SDK previews', async () => {
+  let info;
+  const backend = createClaudeBackend({ claudePath: 'fixture',
+    loadSessions: async () => ({ getSessionInfo: async () => info, listSessions: async () => [{ sessionId: id, ...info }] }) });
+  for (const [metadata, expected] of [
+    [{ customTitle: '发布检查', summary: '旧摘要' }, '发布检查'],
+    [{ summary: '检查发布结果', firstPrompt: '之前的请求' }, '检查发布结果'],
+    [{ summary: '', firstPrompt: '企微单聊 · 本人\n\n**正文**\n\n查看发布日志\n\n**特殊要求**\n- 简洁' }, '查看发布日志'],
+    [{ summary: '企微单聊 · 本人  **正文**  /theads  **特殊要求** - 只回复结果', firstPrompt: '另一条消息' }, '/theads'],
+    [{ summary: '企微群聊 · 本人 **正文** 查进度 **约定**（以正文为准） - 一条约定 **特殊要求** - 简洁' }, '查进度'],
+    [{ summary: '企微群聊 · 本人  旧格式的任务  本条适用的本人约定 - 一条约定' }, '旧格式的任务'],
+    [{ summary: '企微群聊 · 外部用户  权限说明  **正文**  > 处理任务  **引用**  > 引用内容' }, '处理任务'],
+    [{ summary: '企微单聊 · 本人  **正文**  **特殊要求** - 只回复结果' }, undefined],
+    [undefined, undefined],
+  ]) {
+    info = metadata;
+    assert.deepEqual(await backend.listThreads('C:/project'), [{ id, name: expected }]);
+    assert.equal(await chatTitle(backend, id, { compact: true }), (expected || '暂无标题') + ' · …0123456789ab');
+  }
 });
 
 test('Claude cancellation and timeout terminate execution without returning or retrying a partial result', { timeout: 10000 }, async t => {

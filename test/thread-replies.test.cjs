@@ -7,6 +7,8 @@ const { createInterface } = require('node:readline');
 const { PassThrough } = require('node:stream');
 const test = require('node:test');
 const { createReplyReader, readThreadCwd, queueMessage } = require('../src/backends/codex-history.cjs');
+const { createCodexBackend } = require('../src/backends/codex.cjs');
+const { chatTitle, describeStatus } = require('../src/task-status.cjs');
 
 const { buildWecomPrompt } = require('../src/delivery.cjs');
 
@@ -55,7 +57,7 @@ function fixture(pages, timeoutMs = 1000, lookup = false, queueHandler) {
     });
     return child;
   }
-  return { methods, children, queue: extra => queueMessage({ threadId, codexPath: 'codex.exe', execute, timeoutMs,
+  return { methods, children, execute, queue: extra => queueMessage({ threadId, codexPath: 'codex.exe', execute, timeoutMs,
       workingDir: __dirname, prompt: 'a queued request', replyToken: token(12), ...extra }),
     cwd: () => readThreadCwd({ threadId, codexPath: 'codex.exe', execute, timeoutMs }),
     read: createReplyReader({ threadId, codexPath: 'codex.exe',
@@ -139,6 +141,14 @@ test('keeps a desktop turn pending while a second process sees only an inferred 
   assert.equal((await f.read([token(1)])).get(token(1)), 'now completed');
 });
 
+test('reports a recorded interruption for its exact queue client ID even without an error', async () => {
+  const f = fixture(new Map([[undefined, { result: { data: [
+    { ...turn('aborted', [{ ...user('queued work'), clientId: token(12) }], 'interrupted'), completedAt: 100, error: null },
+  ], nextCursor: null } }]]));
+  const result = await f.read(['client:' + token(12), 'client:' + token(13)]);
+  assert.deepEqual([...result.unresolved], [['client:' + token(12), 'turn_interrupted']]);
+});
+
 test('resolves only the requested thread directory without a preset cwd or loading its turns', async () => {
   const known = path.resolve('example-project');
   const pages = new Map([['thread/read', { result: { thread: { id: threadId, cwd: known } } }]]);
@@ -149,6 +159,32 @@ test('resolves only the requested thread directory without a preset cwd or loadi
     await assert.rejects(f.cwd(), thread.id === threadId ? /absolute directory/ : /thread ID/);
   }
   assert.equal(f.children.every(child => child.stopped), true);
+});
+
+test('Codex status shows the saved title or a short preview with only the last UUID segment', async () => {
+  const pages = new Map();
+  const f = fixture(pages, 1000, true);
+  const backend = createCodexBackend({ codexPath: 'codex.exe', execute: f.execute });
+  const target = { threadId, workingDir: __dirname };
+  const snapshot = { target, sources: { thread: '.state', directory: '.state' }, last: { ...target, media: { total: 0 } } };
+  const preview = '企微单聊 · 本人\n\n**正文**\n\n检查构建结果\n第二行\n\n**约定**\n- 一条例外';
+  for (const [name, text, title] of [
+    ['已命名的聊天', preview, '已命名的聊天'],
+    [null, preview, '检查构建结果'],
+    [null, '企微单聊 · 本人 **正文** 检查构建结果 &nbsp; **约定**（以正文为准，仅本次适用） • 一条例外', '检查构建结果'],
+    ['', '企微单聊 · 本人\r\n\r\n查看构建日志\r\n\r\n本条适用的本人约定', '查看构建日志'],
+    [null, '企微群聊 · 外部用户\n\n权限说明\n\n**正文**\n\n> 定位构建失败\n> 补充信息', '定位构建失败'],
+    [null, '长'.repeat(81), '长'.repeat(80) + '…'],
+    [null, '', '暂无标题'],
+  ]) {
+    pages.set('thread/read', { result: { thread: { id: threadId, name, preview: text } } });
+    const lines = (await describeStatus(backend, snapshot)).split('\n');
+    assert.equal(lines[0], '下一条消息 → ' + title + ' · …7547c8efc9c6（.state）');
+    assert.equal(lines[2], '上一条任务 → ' + title + ' · …7547c8efc9c6');
+    assert.equal(lines.length, 6);
+  }
+  pages.set('thread/read', { result: { thread: { id: threadId, name: null, preview } } });
+  assert.equal(await chatTitle(backend, threadId), threadId);
 });
 
 test('withholds two terminal turns sharing a token and deduplicates repeated pages of the same turn', async () => {

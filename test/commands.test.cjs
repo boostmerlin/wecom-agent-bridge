@@ -28,7 +28,8 @@ test('command aliases, memory scopes, stable deletion IDs and atomic replay', t 
   assert.equal(store.memory(parse('/memory'), scope), '#1 测试命令 = node --test');
   assert.equal(store.memory(parse('/MEMORY \n  '), scope), '#1 测试命令 = node --test');
   assert.match(store.memory(parse('/memory ' + '长'.repeat(1001)), scope), /最多 1000/);
-  assert.match(store.append('请测试', dir, route), /^请测试\n\n\*\*约定\*\*（以正文为准，仅本次适用）\n\n- .*node --test/);
+  assert.equal(store.append('请测试', dir, route),
+    '请测试\n\n&nbsp;  \n**约定**（以正文为准，仅本次适用）  \n• 测试命令：node --test');
   for (const other of [{ ...route, chatType: 'group' }, { ...route, senderId: 'guest' }]) {
     assert.equal(store.append('请测试', dir, other), '请测试');
   }
@@ -67,6 +68,9 @@ test('verified WS commands switch the live target in order and acknowledge the o
   inject(path.join(src, 'backends', 'codex-history.cjs'), { listThreads: async ({workingDir}) => {
     assert.equal(workingDir, root);
     return [{ id:known, name:'当前测试' }, { id:second, name:null }];
+  }, readThread: async ({threadId}) => {
+    assert.equal(threadId, second);
+    return { id: second, name: '目标聊天' };
   }, readThreadCwd: async ({threadId}) => {
     if (threadId === second) return secondDir;
     throw Error('unknown chat');
@@ -136,6 +140,7 @@ test('verified WS commands switch the live target in order and acknowledge the o
   assert.equal(by('changed').dir,secondDir);
   assert.doesNotMatch(by('changed').text,/通过后合并/);
   assert.match(by('invalid').text,/失败/);
+  assert.equal(by('switch').text, '已切换聊天 目标聊天 · …000000000002\n工作目录：' + secondDir);
   assert.equal(by('last').target,second);
   assert.equal(status().threadId,second);
   const events = fs.readFileSync(path.join(root, '.state', 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));

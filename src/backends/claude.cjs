@@ -8,6 +8,7 @@ const { createDiagnostics } = require('./cli-diagnostics.cjs');
 const { taskTimeout, processOptions, watchProcess } = require('../process-lifecycle.cjs');
 const { createClaudeDiagnostics } = require('./claude-diagnostics.cjs');
 const { createPermissionHook } = require('./claude-permissions.cjs');
+const { titleFromPreview } = require('../incoming.cjs');
 
 const uuid = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i;
 const retryableLaunchErrors = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE']);
@@ -17,6 +18,10 @@ function parseThreadId(value) {
   const id = typeof value === 'string' ? value.trim() : '';
   if (!uuid.test(id)) throw new Error('Claude threadId 需要填写本机 Claude Code 会话的 UUID。');
   return id.toLowerCase();
+}
+
+function sessionTitle(info, fromFirstPrompt) {
+  return info?.customTitle?.trim() || titleFromPreview(info?.summary) || fromFirstPrompt?.(info?.firstPrompt);
 }
 
 function childEnvironment() {
@@ -148,14 +153,13 @@ function createClaudeBackend({ claudePath, execute = spawn, loadSessions = () =>
       if (!info?.cwd) throw new Error('找不到 Claude 会话的工作目录，请选择本机已有会话。');
       return info.cwd;
     },
-    async getThreadTitle(id) {
-      const info = await sessionInfo(id);
-      return info?.customTitle || info?.summary;
+    async getThreadTitle(id, fromFirstPrompt) {
+      return sessionTitle(await sessionInfo(id), fromFirstPrompt);
     },
     async listThreads(workingDir) {
       const rows = await (await metadata()).listSessions({ dir: workingDir, includeWorktrees: false });
       return rows.filter(row => !row.archived && uuid.test(row.sessionId))
-        .map(row => ({ id: row.sessionId.toLowerCase(), name: row.customTitle || row.summary }));
+        .map(row => ({ id: row.sessionId.toLowerCase(), name: sessionTitle(row, titleFromPreview) }));
     },
     submit,
     // External messages never inherit an owner conversation or its approval callback.

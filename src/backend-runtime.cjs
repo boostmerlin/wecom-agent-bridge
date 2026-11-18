@@ -268,9 +268,12 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
           try {
             if (cmd.name === 'thread') {
               const threadId = backend.parseThreadId(cmd.arg);
-              const workingDir = checkWorkingDir(await backend.getWorkingDir(threadId));
+              const [directory, title] = await Promise.all([
+                backend.getWorkingDir(threadId), chatTitle(backend, threadId, { compact: true }),
+              ]);
+              const workingDir = checkWorkingDir(directory);
               target = { threadId, workingDir };
-              reply = '已切换聊天 ' + threadId + '\n工作目录：' + workingDir;
+              reply = '已切换聊天 ' + title + '\n工作目录：' + workingDir;
             } else {
               if (cmd.name === 'new' && cmd.arg) throw new Error('用法：/new');
               const workingDir = cmd.name === 'cwd' ? path.resolve(checkWorkingDir(cmd.arg)) : origin.workingDir;

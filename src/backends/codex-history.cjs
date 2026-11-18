@@ -92,10 +92,12 @@ function inspectTurn(turn, wanted, observations) {
   let verdict = {};
   if (turn.status === 'failed' || turn.status === 'interrupted') {
     // A separate app-server may infer "interrupted" for an unfinished desktop turn.
-    // Only an ended turn with a recorded structured error is evidence of failure.
+    // The completion timestamp distinguishes a recorded interruption from that inference.
     if (Number.isFinite(turn.completedAt) && turn.error?.codexErrorInfo != null &&
         typeof turn.error.message === 'string' && turn.error.message.trim()) {
       verdict = { reason: 'turn_failed' };
+    } else if (turn.status === 'interrupted' && Number.isFinite(turn.completedAt)) {
+      verdict = { reason: 'turn_interrupted' };
     }
   } else if (turn.status === 'completed') {
     const finals = turn.items.filter(item => item.type === 'agentMessage' && item.phase === 'final_answer'

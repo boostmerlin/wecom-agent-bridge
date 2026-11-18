@@ -103,6 +103,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
   }
   function unmatched(entry, reason = missingReceiptReason, message) {
     const stopped = {
+      turn_interrupted: 'Codex 已中断本次任务。任务可能已产生部分改动，请查看目标聊天。',
       task_cancelled: '已取消本次任务的本地执行。已产生的改动不会撤销，桥接不会自动重跑。',
       task_timeout: '本次任务执行超时，已停止本地进程。任务可能已产生部分改动，桥接不会自动重跑。',
       bridge_stopped: '桥接停止时中断了本次任务。任务可能已产生部分改动，重启后不会自动重跑。',
@@ -178,7 +179,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
       for (const [index, { entry }] of waiting.entries()) {
         const token = keys[index];
         const reason = results.unresolved?.get(token);
-        if (reason === 'turn_failed' || reason === 'ambiguous_turn') {
+        if (reason === 'turn_failed' || reason === 'turn_interrupted' || reason === 'ambiguous_turn') {
           progress = unmatched(entry, reason) || progress;
         } else if (results.has(token)) {
           progress = ready(entry, results.get(token)) || progress;

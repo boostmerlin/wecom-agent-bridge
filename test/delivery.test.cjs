@@ -262,7 +262,7 @@ test('correlates the group turn queued in Codex, sends only its concise final, a
   t.after(() => clearTimeout(hold));
   p.delivery.enqueue('ws-id', '请总结', 'group', route, 'wecom-test-id');
   await done;
-  assert.match(prompt, /^请总结\n\n\*\*特殊要求\*\*\n\n- 先完成正文要求的任务，再简要说明实际结果/);
+  assert.match(prompt, /^请总结\n\n\*\*特殊要求\*\*\n- 先完成正文要求的任务，再简要说明实际结果/);
   assert.match(prompt, /\n- 正文指定的内容或格式，按要求完整给出/);
   assert.match(prompt, /\n- 最终答复只在这里给出，由桥接发回原企微会话/);
   assert.doesNotMatch(prompt, /wecom-request/);

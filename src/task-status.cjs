@@ -1,20 +1,26 @@
 'use strict';
 
-async function chatTitle(backend, id) {
+const { titleFromPreview } = require('./incoming.cjs');
+
+async function chatTitle(backend, id, { compact = false } = {}) {
   if (!id) return '等待新建聊天';
-  if (!backend.getThreadTitle) return id;
-  let timer;
+  let timer, title;
   try {
     const timeout = new Promise(resolve => { timer = setTimeout(resolve, 800); });
-    const title = await Promise.race([backend.getThreadTitle(id), timeout]);
-    return title?.trim() ? title.trim() + ' (' + id + ')' : id;
-  } catch { return id; }
+    const lookup = backend.getThreadTitle?.(id, compact ? titleFromPreview : undefined);
+    title = (await Promise.race([lookup, timeout]))?.trim();
+  } catch { /* A missing title must not prevent a status reply. */ }
   finally { clearTimeout(timer); }
+  if (compact) {
+    const suffix = id.length > 12 ? '…' + id.slice(-12) : id;
+    return (title?.replace(/\s+/g, ' ') || '暂无标题') + ' · ' + suffix;
+  }
+  return title ? title + ' (' + id + ')' : id;
 }
 
 function taskSummary(state) {
   if (!state) return '未找到投递记录';
-  const stopped = { task_cancelled: '已取消', task_timeout: '执行超时', bridge_stopped: '桥接停止，任务已中断' };
+  const stopped = { turn_interrupted: '已中断', task_cancelled: '已取消', task_timeout: '执行超时', bridge_stopped: '桥接停止，任务已中断' };
   const delivery = { queued: '本地排队', submitting: state.started ? '正在处理' : '正在投递',
     queued_in_codex: '已进入后端队列', rejected: '投递被拒绝', uncertain: '投递结果未知', failed: '处理失败', completed: '已完成' };
   const reply = { registered: '尚无答复', waiting: '等待最终答复', ready: '等待回发', sending: '回发中',
@@ -25,7 +31,7 @@ function taskSummary(state) {
 async function describeStatus(backend, { target, sources, error, last }) {
   const titles = new Map();
   function lookup(id) {
-    if (!titles.has(id)) titles.set(id, chatTitle(backend, id));
+    if (!titles.has(id)) titles.set(id, chatTitle(backend, id, { compact: true }));
     return titles.get(id);
   }
   const [next, previous] = await Promise.all([error ? null : lookup(target.threadId), last && lookup(last.threadId)]);

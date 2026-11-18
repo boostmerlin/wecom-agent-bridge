@@ -121,6 +121,25 @@ test('desktop reader batches matching tokens, releases failures, and expires onl
   assert.equal(deliveries[3], 'late');
 });
 
+test('a confirmed interruption releases the delivery hold and replies to the original conversation', async t => {
+  const { open, add } = fixture(t);
+  const released = [], sent = [];
+  let token;
+  const ctrl = open({
+    onTurnResolved: (entry, reason) => released.push([entry, reason]),
+    readReplies: async () => Object.assign(new Map(), { unresolved: new Map([[token, 'turn_interrupted']]) }),
+    sendReply: async (route, text) => sent.push({ route, text }),
+  });
+  token = add(ctrl, 1, group);
+  ctrl.start(1);
+  assert.equal(ctrl.hasPendingTurn(), true);
+  await until(() => sent.length === 1);
+  assert.equal(ctrl.hasPendingTurn(), false);
+  assert.deepEqual(released, [[1, 'turn_interrupted']]);
+  assert.deepEqual(sent[0].route, group);
+  assert.match(sent[0].text, /Codex.*中断/);
+});
+
 test('a confirmed temporary failure resumes from the unsent part on restart, with persisted backoff', async t => {
   const { events, open, add } = fixture(t);
   const attempts = [];

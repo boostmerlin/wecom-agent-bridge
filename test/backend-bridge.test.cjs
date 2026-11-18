@@ -115,17 +115,17 @@ test('another backend handles WeCom commands, new turns and replies across a res
   for (const name of ['/status', '/bind', '/retry', '/threads', '/memory', '/forget']) assert.ok(help.includes(name));
   assert.ok(!help.includes('/save'));
   const groupStatus = await send('/status', true);
-  assert.match(groupStatus, /上一条任务 → chat\/c/);
+  assert.match(groupStatus, /上一条任务 → 暂无标题 · chat\/c/);
   assert.match(groupStatus, /投递：已完成；回复：已回发/);
   assert.match(groupStatus, /附件：无/);
   assert.match(await send('/bind', true), /本会话已绑定/);
   assert.match(await send('/thread chat/b'), /已切换聊天/);
   await stop('restart');
   await start();
-  assert.match(await send('/status', true), /下一条消息 → chat\/c（会话绑定）/);
+  assert.match(await send('/status', true), /下一条消息 → 暂无标题 · chat\/c（会话绑定）/);
   assert.match(await send('/status'), /下一条消息 → Beta.*\.state/);
   assert.match(await send('/thread chat/b', true), /已切换聊天/);
-  assert.match(await send('/status', true), /下一条消息 → Beta[\s\S]+上一条任务 → chat\/c/);
+  assert.match(await send('/status', true), /下一条消息 → Beta[\s\S]+上一条任务 → 暂无标题 · chat\/c/);
   assert.match(await send('/retry', true), /没有可安全重试/);
   const project = path.join(root, 'project two');
   fs.mkdirSync(project);
@@ -196,7 +196,7 @@ test('another backend handles WeCom commands, new turns and replies across a res
   await started.promise;
   assert.match(await send('/help', true), /桥接指令/);
   // send() listens for the first matching conversation's reply.
-  assert.match(await slow, /下一条消息 → chat\/b/);
+  assert.match(await slow, /下一条消息 → 暂无标题 · chat\/b/);
   replies.off('sent', observe);
   assert.deepEqual(answers.map(answer => answer.chatId), ['team', 'me']);
   assert.equal(lookups, 1);

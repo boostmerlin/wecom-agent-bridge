@@ -130,8 +130,9 @@ function createCommandStore(directory) {
     append(text, dir, route) {
       const rows = notes.all(scope(dir, route));
       if (!rows.length) return text;
-      return text + '\n\n**约定**（以正文为准，仅本次适用）\n\n' +
-        rows.map(r => '- ' + (r.name ? r.name + '：' : '') + r.body).join('\n');
+      // Keep the heading and bullets in one paragraph so the renderer adds no list margin.
+      return text + '\n\n&nbsp;  \n**约定**（以正文为准，仅本次适用）  \n' +
+        rows.map(r => '• ' + (r.name ? r.name + '：' : '') + r.body).join('  \n');
     },
     claim(id, key) {
       db.prepare('INSERT INTO received(id,queue_key) VALUES(?,?) ON CONFLICT DO NOTHING').run(id,key);
