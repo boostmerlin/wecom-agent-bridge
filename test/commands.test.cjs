@@ -28,7 +28,7 @@ test('command aliases, memory scopes, stable deletion IDs and atomic replay', t 
   assert.equal(store.memory(parse('/memory'), scope), '#1 测试命令 = node --test');
   assert.equal(store.memory(parse('/MEMORY \n  '), scope), '#1 测试命令 = node --test');
   assert.match(store.memory(parse('/memory ' + '长'.repeat(1001)), scope), /最多 1000/);
-  assert.match(store.append('请测试', dir, route), /node --test/);
+  assert.match(store.append('请测试', dir, route), /^请测试\n\n\*\*约定\*\*（以正文为准，仅本次适用）\n\n- .*node --test/);
   for (const other of [{ ...route, chatType: 'group' }, { ...route, senderId: 'guest' }]) {
     assert.equal(store.append('请测试', dir, other), '请测试');
   }

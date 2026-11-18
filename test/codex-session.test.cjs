@@ -22,6 +22,7 @@ function server(mode, threadId) {
     if (m.method === 'initialize') send({ id: m.id, result: {} });
     if (['thread/start', 'thread/resume'].includes(m.method)) {
       if (mode === 'busy') return send({ id: m.id, error: { code: -32600, message: 'thread ' + threadId + ' already has an active writer' } });
+      if (mode === 'other-writer') return send({ id: m.id, error: { code: -32600, message: 'thread 11234567-89ab-4def-8123-0123456789ab already has an active writer' } });
       send({ id: m.id, result: { thread: { id: threadId }, approvalPolicy: 'on-request' } });
     }
     if (m.method === 'turn/start') {
@@ -37,10 +38,10 @@ function server(mode, threadId) {
   process.stdin.on('end', () => process.exit(0));
 }
 
-function fixture(t, mode = 'normal') {
+function fixture(t, mode = 'normal', options = {}) {
   const calls = [], rpc = [], diagnostics = [];
   let child;
-  const backend = createCodexBackend({ codexPath: 'fixture', enqueue: () => assert.fail('cannot queue approvals to desktop'),
+  const backend = createCodexBackend({ codexPath: 'fixture', enqueue: () => assert.fail('unexpected desktop queue submission'), ...options,
     execute(file, args, options) {
       calls.push({ args, options });
       child = spawn(process.execPath, ['-e', '(' + server.toString() + ')(' + JSON.stringify(mode) + ',' + JSON.stringify(threadId) + ')'], options);
@@ -54,16 +55,19 @@ function fixture(t, mode = 'normal') {
   return { backend, turn, calls, rpc, diagnostics };
 }
 
-test('owner Codex uses an app-server human approval and returns only this turn final answer', async t => {
+test('owner Codex resumes with full access and returns only this turn final answer', async t => {
   const f = fixture(t);
   const result = await f.backend.submit(f.turn);
   assert.deepEqual(result, { state: 'completed', text: 'accept' });
   assert.ok(f.calls[0].args.includes('app-server'));
   const start = f.rpc.find(x => x.method === 'turn/start').params;
-  assert.equal(start.approvalPolicy, 'on-request');
+  assert.equal(start.approvalPolicy, 'never');
   assert.equal(start.approvalsReviewer, 'user');
-  assert.equal(start.sandboxPolicy.type, 'workspaceWrite');
-  assert.equal(start.sandboxPolicy.networkAccess, true);
+  assert.deepEqual(start.sandboxPolicy, { type: 'dangerFullAccess' });
+  const resume = f.rpc.find(x => x.method === 'thread/resume').params;
+  assert.equal(resume.approvalPolicy, 'never');
+  assert.equal(resume.sandbox, 'danger-full-access');
+  assert.ok(f.calls[0].args.includes('sandbox_mode="danger-full-access"'));
   assert.equal(f.diagnostics[0].command, 'app-server');
 });
 
@@ -87,16 +91,35 @@ test('Codex creates a thread before submitting and never retries an ambiguous ex
   const created = [];
   const result = await f.backend.submit({ ...f.turn, threadId: undefined, onCreated: id => created.push(id) });
   assert.deepEqual(created, [threadId]);
+  const start = f.rpc.find(x => x.method === 'thread/start').params;
+  assert.equal(start.approvalPolicy, 'never');
+  assert.equal(start.sandbox, 'danger-full-access');
   assert.equal(result.state, 'uncertain');
   assert.equal(f.calls.length, 1);
   assert.equal(f.diagnostics[0].exitCode, 7);
 });
 
-test('a busy desktop thread is rejected without silently losing WeCom approval control', async t => {
-  const f = fixture(t, 'busy');
-  const result = await f.backend.submit(f.turn);
-  assert.deepEqual(result, { state: 'rejected', reason: 'thread_busy' });
+test('a confirmed writer for the target queues this owner message and wakes the same desktop thread', async t => {
+  const queued = [], woken = [];
+  const receipt = { state: 'accepted', queueId: 'desktop-queue-id', replyId: 'bridge-reply-id', wakeConfirmed: false };
+  const f = fixture(t, 'busy', {
+    enqueue: async ({ threadId, workingDir, prompt, replyToken }) => {
+      queued.push({ threadId, workingDir, prompt, replyToken });
+      return receipt;
+    },
+    wakeDesktop: async id => woken.push(id),
+  });
+  const result = await f.backend.submit({ ...f.turn, replyToken: receipt.replyId });
+  assert.deepEqual(result, receipt);
+  assert.deepEqual(queued, [{ threadId, workingDir: f.turn.workingDir, prompt: f.turn.prompt, replyToken: receipt.replyId }]);
   assert.ok(!f.rpc.some(x => x.method === 'turn/start'));
+  await f.backend.afterAccepted(result, threadId, () => {});
+  assert.deepEqual(woken, [threadId]);
+});
+
+test('a writer error for another thread is not a reason to queue the current task', async t => {
+  const f = fixture(t, 'other-writer');
+  assert.deepEqual(await f.backend.submit(f.turn), { state: 'rejected', reason: 'codex_session_failed' });
 });
 
 test('cancellation invalidates pending human approval and terminates Codex', async t => {

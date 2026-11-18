@@ -24,7 +24,7 @@ function fixture(pages, timeoutMs = 1000, lookup = false, queueHandler) {
     assert.equal(command, 'codex.exe');
     assert.deepEqual(args, ['app-server', '--stdio']);
     assert.equal(options.shell, false);
-    assert.equal(options.cwd, lookup ? undefined : 'target-project');
+    assert.equal(options.cwd, lookup ? undefined : __dirname);
     const child = new EventEmitter();
     children.push(child);
     child.stdin = new PassThrough();
@@ -41,10 +41,9 @@ function fixture(pages, timeoutMs = 1000, lookup = false, queueHandler) {
       let response;
       if (method === 'initialize') response = { result: {} };
       else if (method === 'thread/queue/add') response = queueHandler(params);
-      else if (lookup) {
-        assert.equal(method, 'thread/read');
+      else if (method === 'thread/read') {
         assert.deepEqual(params, { threadId, includeTurns: false });
-        response = pages.get('thread/read');
+        response = pages.get('thread/read') ?? (queueHandler && { result: { thread: { id: threadId, cwd: __dirname } } });
       } else {
         assert.equal(method, 'thread/turns/list');
         assert.equal(params.threadId, threadId);
@@ -57,10 +56,10 @@ function fixture(pages, timeoutMs = 1000, lookup = false, queueHandler) {
     return child;
   }
   return { methods, children, queue: extra => queueMessage({ threadId, codexPath: 'codex.exe', execute, timeoutMs,
-      workingDir: 'target-project', prompt: 'a queued request', replyToken: token(12), ...extra }),
+      workingDir: __dirname, prompt: 'a queued request', replyToken: token(12), ...extra }),
     cwd: () => readThreadCwd({ threadId, codexPath: 'codex.exe', execute, timeoutMs }),
     read: createReplyReader({ threadId, codexPath: 'codex.exe',
-    workingDir: 'target-project', execute, timeoutMs }) };
+    workingDir: __dirname, execute, timeoutMs }) };
 }
 
 test('queue submission uses a persistent client ID distinct from the queue receipt and matches its final', async () => {
@@ -91,6 +90,14 @@ test('ambiguous queue outcomes never retry a submission or claim a verified rece
     assert.equal(f.methods.filter(method => method === 'thread/queue/add').length, 1);
     assert.ok(f.children.every(child => child.stopped));
   }
+});
+
+test('desktop queue refuses a mismatched working directory before submitting', async () => {
+  const pages = new Map([['thread/read', { result: { thread: { id: threadId, cwd: path.dirname(__dirname) } } }]]);
+  const f = fixture(pages, 1000, false, () => assert.fail('must not enqueue into another project'));
+  const result = await f.queue({ onDetached: () => assert.fail('must not detach before validating target') });
+  assert.deepEqual(result, { state: 'rejected', reason: 'desktop_working_dir_mismatch' });
+  assert.deepEqual(f.methods, ['initialize', 'initialized', 'thread/read']);
 });
 
 test('reads every cursor for the target, selects only completed explicit finals and exact bridge headers', async () => {

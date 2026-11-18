@@ -127,6 +127,7 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
   assert.equal(await send('first', { group: true }), '收到');
   assert.equal(calls[0].resumed, false);
   assert.equal(calls[0].cwd, project);
+  assert.match(calls[0].prompt, /\*\*正文\*\*\n\nfirst\n\n\*\*特殊要求\*\*/);
   assert.match(await send('/threads', { group: true }), new RegExp(sessionA));
   assert.match(await send('/status', { group: true }), /后端：Claude Code[\s\S]*回复：已回发/);
   assert.match(await send('/threads'), new RegExp(sessionA));
@@ -136,7 +137,7 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
   emit('duplicate must not execute', { id: duplicate });
   await pair;
   assert.equal(calls.length, 2);
-  assert.match(calls[1].prompt, /回复语言：中文/);
+  assert.match(calls[1].prompt, /\*\*正文\*\*\n\nsecond\n\n\*\*约定\*\*（以正文为准，仅本次适用）\n\n- 回复语言：中文\n\n\*\*特殊要求\*\*/);
   await stop('restart');
   await start();
   assert.equal(await send('after restart'), '收到');

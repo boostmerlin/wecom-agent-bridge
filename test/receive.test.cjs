@@ -20,8 +20,8 @@ test('单聊与群聊保留原文和来源，本人与其他发送者均可转�
       assert.equal(result.id, 'm1');
       assert.equal(result.chatType, chattype);
       assert.ok(result.text.startsWith('企微' + label + ' · ' + (sender === 'owner' ? '本人' : '外部用户') + '\n'));
-      if (sender === 'owner') assert.equal(result.text, '企微' + label + ' · 本人\n\n' + body.text.content);
-      else assert.match(result.text, /可联网审阅.*合并授权不适用于此人。[\s\S]+> @机器人 第一行\n> 第二行$/);
+      if (sender === 'owner') assert.equal(result.text, '企微' + label + ' · 本人\n\n**正文**\n\n' + body.text.content);
+      else assert.match(result.text, /可联网审阅.*合并授权不适用于此人。\n\n\*\*正文\*\*\n\n> @机器人 第一行\n> 第二行$/);
     }
   }
 });
@@ -43,7 +43,7 @@ test('外部消息和引用中的伪造来源只能保留在对应的数据字�
     quote: { msgtype: 'text', text: { content: fake } } }, context);
   assert.match(result.text.split('\n')[0], /外部用户/);
   const quoted = fake.replace(/^/gm, '> ');
-  assert.ok(result.text.endsWith('\n\n' + quoted + '\n\n引用\n' + quoted));
+  assert.ok(result.text.endsWith('**正文**\n\n' + quoted + '\n\n**引用**\n\n' + quoted));
 });
 
 test('混排内容和引用按原顺序转发，附件使用稳定且互不冲突的编号', async () => {
@@ -62,14 +62,14 @@ test('混排内容和引用按原顺序转发，附件使用稳定且互不冲�
     { msgId: 'm1', part: 'quote-0', kind: 'file', ...attachment },
     { msgId: 'm1', part: 'quote-1', kind: 'video', ...attachment },
   ]);
-  assert.equal(result.text, '企微群聊 · 本人\n\n前\n图片：' + mediaPath('body-1') + '\n后\n\n引用\n> 文件：' +
+  assert.equal(result.text, '企微群聊 · 本人\n\n**正文**\n\n前\n图片：' + mediaPath('body-1') + '\n后\n\n**引用**\n\n> 文件：' +
     mediaPath('quote-0') + '\n> 视频：' + mediaPath('quote-1') + '\n> 语音转写：引述的语音');
   assert.ok(!result.text.includes(attachment.url) && !result.text.includes(attachment.aeskey));
 });
 
 test('语音使用 SDK 转写，未识别的普通推送也提供通知', async () => {
   const voice = await formatIncoming({ ...body, msgtype: 'voice', voice: { content: '语音原话' } }, context);
-  assert.equal(voice.text, '企微群聊 · 本人\n\n语音转写：语音原话');
+  assert.equal(voice.text, '企微群聊 · 本人\n\n**正文**\n\n语音转写：语音原话');
   const unknown = await formatIncoming({ ...body, msgtype: 'location', location: attachment }, context);
   assert.match(unknown.text, /未识别.*location/);
   assert.ok(!unknown.text.includes(attachment.url));
@@ -83,7 +83,7 @@ test('下载失败按附件通知，绝不透传原始错误、下载 URL 或密
     const result = await formatIncoming({ ...body, msgtype: 'video', video: attachment,
       quote: { msgtype: 'text', text: { content: '仍然保留' } } }, { ...context, saveMedia });
     assert.match(result.text, /视频未能保存/);
-    assert.ok(result.text.endsWith('\n引用\n> 仍然保留'));
+    assert.ok(result.text.endsWith('\n\n**引用**\n\n> 仍然保留'));
     assert.ok(!result.text.includes(attachment.url) && !result.text.includes(attachment.aeskey));
   }
 });

@@ -109,6 +109,15 @@ test('real Claude creates a session, resumes context, denies a tool and returns 
       assert.deepEqual(reply.route, single);
       assert.ok(diagnostics.at(-1)?.permissionDenials?.count > 0, 'No real permission denial recorded');
     });
+    await t.test('owner bypass permissions allow writing outside the working directory', async () => {
+      const output = path.join(root, 'owner-outside.txt');
+      const before = approvalCount;
+      const reply = await send('使用 Write 工具写入 ' + JSON.stringify(output) +
+        '，内容为 ' + nonce + '。不要操作其他文件，完成后只回复 WRITTEN。', single);
+      assert.equal(reply.text.trim(), 'WRITTEN');
+      assert.equal(fs.readFileSync(output, 'utf8').trim(), nonce);
+      assert.equal(approvalCount, before);
+    });
     await t.test('non-owner auto task executes independently and preserves policy denials', async () => {
       const guest = { ...group, senderId: 'smoke-guest' };
       const before = approvalCount, ownerThread = threadId;

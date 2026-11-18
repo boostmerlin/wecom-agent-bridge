@@ -9,14 +9,19 @@ const { taskTimeout } = require('./process-lifecycle.cjs');
 
 const rejectionNotices = {
   external_sandbox_unsupported: '当前后端暂不支持其他人的任务，本条消息未执行。请由机器人绑定的本人发送任务。',
-  thread_busy: '目标 Codex 聊天被其他进程占用，本次消息未投递。请释放该聊天后发送 /retry；也可用 /new 新建聊天，再重新发送任务。',
+  desktop_working_dir_mismatch: '目标 Codex 聊天和桥接的工作目录不同，消息未投递。请用 /thread 重新选择这个聊天，再发送任务。',
 };
 
 function buildWecomPrompt(text) {
-  return (
-    text +
-    "\n\n请完成正文要求的任务后回复实际结果。默认简洁，优先说明结论、关键结果和未完成事项。正文要求提供的代码、命令、文案等内容应完整给出；指定了回复内容或格式时，严格遵循。桥接会将最终答复发回原企微会话，请勿自行发送。"
-  );
+  return [
+    text,
+    "",
+    "**特殊要求**",
+    "",
+    "- 先完成正文要求的任务，再简要说明实际结果。优先说明结论、关键结果和未完成事项。",
+    "- 正文指定的内容或格式，按要求完整给出。",
+    "- 最终答复只在这里给出，由桥接发回原企微会话。",
+  ].join("\n");
 }
 
 function createDelivery({

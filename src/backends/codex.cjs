@@ -82,7 +82,8 @@ function launchFailure(child, error) {
 }
 
 function externalArgs(workingDir) {
-  const args = ["-a", "never",
+  const args = ["-a", "on-request",
+    "-c", 'approvals_reviewer="auto_review"',
     "-c", "sandbox_workspace_write.network_access=true",
     "-c", "sandbox_workspace_write.writable_roots=[]",
     "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
@@ -100,12 +101,12 @@ function externalArgs(workingDir) {
     "--ignore-user-config", "--ignore-rules", "-C", workingDir];
 }
 
-function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, onDiagnostic, onDetached, replyToken, signal, timeoutMs }, outputFile, external, enqueue) {
+function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, onCreated, onDiagnostic, signal, timeoutMs }, outputFile, external) {
   timeoutMs = taskTimeout(timeoutMs);
   if (signal?.aborted) return Promise.resolve({ state: 'uncertain', reason: 'task_cancelled' });
   const diagnostics = createDiagnostics("exec", prompt, onDiagnostic);
   const startedAt = performance.now();
-  const args = external ? externalArgs(workingDir) : ["exec", "-c", "sandbox_workspace_write.network_access=true", "-C", workingDir];
+  const args = external ? externalArgs(workingDir) : ["exec", "-c", 'approval_policy="never"', "--sandbox", "danger-full-access", "-C", workingDir];
   if (threadId) args.push("resume");
   args.push("--json", "--skip-git-repo-check");
   if (outputFile) args.push("--output-last-message", outputFile);
@@ -211,10 +212,7 @@ function runTurn(execute, codexPath, { workingDir, threadId, prompt, onStarted, 
       if (lifecycle.reason) return resolve({ state: 'uncertain', reason: lifecycle.reason });
       if (launchError) return resolve(launchFailure(child, launchError));
       if (!external && code === 1 && activeWriter && !sawEvent && !inputFailed) {
-        onDetached?.();
-        return resolve(
-          enqueue({ codexPath, workingDir, threadId, prompt, replyToken, execute, onDiagnostic }),
-        );
+        return resolve({ state: "rejected", reason: "thread_busy" });
       }
       if (
         code === 0 &&
@@ -249,10 +247,16 @@ function parseThreadId(value) {
 function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestDesktopWake, enqueue = queueMessage }) {
   if (typeof codexPath !== "string" || !codexPath.trim()) throw new Error("Missing Codex executable");
   async function submitTurn(turn, external) {
-    if (!external && turn.onApproval) return runCodexSession(execute, codexPath, turn, childEnvironment(true));
-    const outputFile = turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
+    const useAppServer = !external && turn.onApproval;
+    const outputFile = !useAppServer && turn.replyToken && join(turn.stateDir, turn.replyToken + ".final.tmp");
     try {
-      const result = await runTurn(execute, codexPath, turn, outputFile, external, enqueue);
+      const result = useAppServer
+        ? await runCodexSession(execute, codexPath, turn, childEnvironment(true))
+        : await runTurn(execute, codexPath, turn, outputFile, external);
+      if (!external && turn.threadId && result.state === "rejected" && result.reason === "thread_busy") {
+        const { workingDir, threadId, prompt, replyToken, signal, onDetached, onDiagnostic } = turn;
+        return await enqueue({ codexPath, workingDir, threadId, prompt, replyToken, signal, execute, onDetached, onDiagnostic });
+      }
       if (outputFile && result.state === "completed") {
         try { result.text = readFileSync(outputFile, "utf8"); }
         catch { /* A missing final cannot be sent back to the chat. */ }

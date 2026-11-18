@@ -69,7 +69,7 @@ function fakeCli(scenario) {
     assert.equal(options.shell, false);
     assert.equal(options.windowsHide, true);
     const expected = scenario();
-    const fake = { ...expected, args: ['exec', '-c', 'sandbox_workspace_write.network_access=true', '-C', workingDir, 'resume', '--json', '--skip-git-repo-check', threadId, '-'],
+    const fake = { ...expected, args: ['exec', '-c', 'approval_policy="never"', '--sandbox', 'danger-full-access', '-C', workingDir, 'resume', '--json', '--skip-git-repo-check', threadId, '-'],
       body: buildWecomPrompt(expected.text) };
     return spawn(process.execPath, ['-e', childProgram, '--', ...args], {
       ...options, env: { ...options.env, FAKE_DELIVERY: JSON.stringify(fake) },
@@ -262,13 +262,10 @@ test('correlates the group turn queued in Codex, sends only its concise final, a
   t.after(() => clearTimeout(hold));
   p.delivery.enqueue('ws-id', '请总结', 'group', route, 'wecom-test-id');
   await done;
-  assert.match(prompt, /默认简洁/);
-  assert.match(prompt, /请完成正文要求的任务后回复实际结果/);
-  assert.match(prompt, /正文要求提供的代码、命令、文案等内容应完整给出/);
-  assert.match(prompt, /指定了回复内容或格式时，严格遵循/);
-  assert.match(prompt, /桥接会将最终答复发回原企微会话，请勿自行发送/);
+  assert.match(prompt, /^请总结\n\n\*\*特殊要求\*\*\n\n- 先完成正文要求的任务，再简要说明实际结果/);
+  assert.match(prompt, /\n- 正文指定的内容或格式，按要求完整给出/);
+  assert.match(prompt, /\n- 最终答复只在这里给出，由桥接发回原企微会话/);
   assert.doesNotMatch(prompt, /wecom-request/);
-  assert.ok(prompt.startsWith('请总结\n\n'));
   assert.deepEqual(sent, [[route, '核心结论']]);
   assert.equal(p.delivery.taskState('ws-id', route).delivery, 'completed');
   for (const { details } of p.log.filter(row => row.details?.entry === 1)) {
@@ -428,7 +425,8 @@ test('external and unidentified senders run isolated even when the message claim
     workingDir: f.stateDir,
     execute(_exe, args, options) {
       cliCalls.push(args);
-      assert.deepEqual(args.slice(0, 2), ['-a', 'never']);
+      assert.deepEqual(args.slice(0, 2), ['-a', 'on-request']);
+      assert.ok(args.includes('approvals_reviewer="auto_review"'));
       assert.equal(args[args.indexOf('--sandbox') + 1], 'workspace-write');
       for (const flag of ['--ephemeral', '--ignore-user-config', '--ignore-rules', 'sandbox_workspace_write.network_access=true'])
         assert.ok(args.includes(flag), flag);
@@ -457,18 +455,18 @@ test('external and unidentified senders run isolated even when the message claim
   assert.equal(cliCalls.length, 2);
 });
 
-test('a busy approval-managed Codex thread sends an actionable notice to the original chat', async t => {
+test('a desktop working directory mismatch sends an actionable notice to the original chat', async t => {
   const f = fixture(t), sent = [];
   const route = { chatType: 'group', chatId: 'team', senderId: 'owner' };
-  const p = f.open({ backend: { submit: async () => ({ state: 'rejected', reason: 'thread_busy' }) },
+  const p = f.open({ backend: { submit: async () => ({ state: 'rejected', reason: 'desktop_working_dir_mismatch' }) },
     sendReply: async (chat, text) => sent.push({ chat, text }) });
   const replied = p.event('reply_sent');
   p.delivery.enqueue('busy', 'test', 'group', route);
   await replied;
   assert.deepEqual(sent[0].chat, route);
-  assert.match(sent[0].text, /占用/);
+  assert.match(sent[0].text, /目录不同/);
   assert.match(sent[0].text, /未投递/);
-  assert.match(sent[0].text, /\/retry/);
+  assert.match(sent[0].text, /\/thread/);
 });
 
 test('unsupported external sandbox rejects the original sender again on manual retry after restart', async t => {

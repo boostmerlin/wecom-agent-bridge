@@ -1,7 +1,8 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const { isAbsolute } = require('node:path');
+const { isAbsolute, relative } = require('node:path');
+const { realpathSync } = require('node:fs');
 const { createInterface } = require('node:readline');
 const { randomUUID } = require('node:crypto');
 const { createDiagnostics } = require('./cli-diagnostics.cjs');
@@ -177,13 +178,17 @@ async function listThreads({ codexPath, workingDir, execute = spawn, timeoutMs =
   }
 }
 
+async function threadSnapshot(reader, threadId) {
+  const { thread } = await reader.request('thread/read', { threadId, includeTurns: false });
+  if (thread?.id?.toLowerCase() !== threadId.toLowerCase()) throw new Error('Unexpected Codex thread ID');
+  return thread;
+}
+
 async function readThread({ codexPath, threadId, execute = spawn, timeoutMs = 30_000 }) {
   const reader = openReader(codexPath, undefined, execute, timeoutMs);
   try {
     await reader.initialize();
-    const { thread } = await reader.request('thread/read', { threadId, includeTurns: false });
-    if (thread?.id?.toLowerCase() !== threadId.toLowerCase()) throw new Error('Unexpected Codex thread ID');
-    return thread;
+    return await threadSnapshot(reader, threadId);
   } finally {
     reader.close();
   }
@@ -195,13 +200,23 @@ async function readThreadCwd(options) {
   return cwd;
 }
 
-async function queueMessage({ codexPath, workingDir, threadId, prompt, replyToken,
-  execute = spawn, timeoutMs = 30_000, onDiagnostic }) {
-  let reader;
+async function queueMessage({ codexPath, workingDir, threadId, prompt, replyToken, signal,
+  execute = spawn, timeoutMs = 30_000, onDetached, onDiagnostic }) {
+  let reader, submitting = false;
+  const cancelled = () => ({ state: 'uncertain', reason: signal.reason === 'bridge_stopped' ? 'bridge_stopped' : 'task_cancelled' });
+  if (signal?.aborted) return cancelled();
   const clientId = replyToken || randomUUID();
   try {
     reader = openReader(codexPath, workingDir, execute, timeoutMs, { prompt, onDiagnostic });
     await reader.initialize();
+    // Queue entries inherit the writer's directory. Validate it before submitting.
+    const { cwd } = await threadSnapshot(reader, threadId);
+    if (signal?.aborted) return cancelled();
+    if (typeof cwd !== 'string' || !isAbsolute(cwd) || relative(realpathSync(workingDir), realpathSync(cwd))) {
+      return { state: 'rejected', reason: 'desktop_working_dir_mismatch' };
+    }
+    onDetached?.();
+    submitting = true;
     const { queuedSubmission } = await reader.request('thread/queue/add', {
       threadId, clientUserMessageId: clientId, input: [{ type: 'text', text: prompt }],
     });
@@ -210,6 +225,7 @@ async function queueMessage({ codexPath, workingDir, threadId, prompt, replyToke
     }
     return { state: 'accepted', queueId: queuedSubmission.id, replyId: clientId, wakeConfirmed: false };
   } catch {
+    if (!submitting) return signal?.aborted ? cancelled() : { state: 'rejected', reason: 'desktop_target_unavailable' };
     // The add may have committed before the connection broke. Never submit again.
     return { state: 'uncertain', reason: 'queue_outcome_unknown' };
   } finally {

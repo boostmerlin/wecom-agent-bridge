@@ -130,7 +130,7 @@ function createCommandStore(directory) {
     append(text, dir, route) {
       const rows = notes.all(scope(dir, route));
       if (!rows.length) return text;
-      return text + '\n\n本条适用的本人约定（以正文为先，仅对本条生效）\n' +
+      return text + '\n\n**约定**（以正文为准，仅本次适用）\n\n' +
         rows.map(r => '- ' + (r.name ? r.name + '：' : '') + r.body).join('\n');
     },
     claim(id, key) {

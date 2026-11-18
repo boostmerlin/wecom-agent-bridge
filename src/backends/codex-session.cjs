@@ -6,17 +6,16 @@ const { createCodexApprovals } = require('./codex-permissions.cjs');
 const { processOptions, watchProcess, taskTimeout } = require('../process-lifecycle.cjs');
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
-// This connection owns execution and approvals. Never hand its task to a desktop queue.
+// This connection owns execution and approvals when it can acquire the thread writer.
 function runCodexSession(execute, codexPath, turn, env) {
   const { workingDir, prompt, signal, onApproval, onDiagnostic } = turn;
   const timeoutMs = taskTimeout(turn.timeoutMs);
   if (signal?.aborted) return Promise.resolve({ state: 'uncertain', reason: 'task_cancelled' });
   const diagnostics = createDiagnostics('app-server', prompt, onDiagnostic);
   const startedAt = performance.now();
-  const policy = { approvalPolicy: 'on-request', approvalsReviewer: 'user' };
-  const args = ['app-server', '--stdio', '-c', 'approval_policy="on-request"', '-c', 'approvals_reviewer="user"',
-    '-c', 'sandbox_mode="workspace-write"', '-c', 'sandbox_workspace_write.network_access=true'];
-  if (process.platform === 'win32') args.push('-c', 'windows.sandbox="elevated"');
+  const policy = { approvalPolicy: 'never', approvalsReviewer: 'user' };
+  const args = ['app-server', '--stdio', '-c', 'approval_policy="never"', '-c', 'approvals_reviewer="user"',
+    '-c', 'sandbox_mode="danger-full-access"'];
   return new Promise(resolve => {
     let child, lifecycle, approvals, threadId = turn.threadId, turnId, result, launchError;
     let closed = false, submitted = false, sequence = 0, cleanupTimer;
@@ -43,7 +42,7 @@ function runCodexSession(execute, codexPath, turn, env) {
           waiting.delete(id);
           reject(new Error(method + ' response timed out'));
         }, 30000);
-        waiting.set(id, { resolve, reject, timer });
+        waiting.set(id, { method, resolve, reject, timer });
         write({ id, method, params });
       });
     }
@@ -96,7 +95,7 @@ function runCodexSession(execute, codexPath, turn, env) {
         if (!pending) return;
         clearTimeout(pending.timer);
         waiting.delete(message.id);
-        if (message.error) pending.reject(Object.assign(new Error(message.error.message), { rpc: true }));
+        if (message.error) pending.reject(Object.assign(new Error(message.error.message), { rpcMethod: pending.method }));
         else pending.resolve(message.result);
         return;
       }
@@ -126,7 +125,7 @@ function runCodexSession(execute, codexPath, turn, env) {
         if (closed || lifecycle.reason) return;
         write({ method: 'initialized', params: {} });
         const target = await request(threadId ? 'thread/resume' : 'thread/start', {
-          ...(threadId ? { threadId, excludeTurns: true } : {}), cwd: workingDir, ...policy, sandbox: 'workspace-write',
+          ...(threadId ? { threadId, excludeTurns: true } : {}), cwd: workingDir, ...policy, sandbox: 'danger-full-access',
         });
         if (!uuid.test(target?.thread?.id) || (threadId && target.thread.id !== threadId)) throw new Error('Unexpected Codex thread');
         if (!threadId) { threadId = target.thread.id; turn.onCreated?.(threadId); }
@@ -134,8 +133,7 @@ function runCodexSession(execute, codexPath, turn, env) {
         submitted = true;
         const started = await request('turn/start', { threadId, cwd: workingDir, ...policy,
           clientUserMessageId: turn.replyToken,
-          sandboxPolicy: { type: 'workspaceWrite', writableRoots: [workingDir], networkAccess: true,
-            excludeTmpdirEnvVar: true, excludeSlashTmp: true }, input: [{ type: 'text', text: prompt }] });
+          sandboxPolicy: { type: 'dangerFullAccess' }, input: [{ type: 'text', text: prompt }] });
         if (closed || signal?.aborted || lifecycle.reason) return;
         if (!started?.turn?.id || typeof started.turn.id !== 'string') throw new Error('Missing Codex turn');
         turnId = started.turn.id;
@@ -146,9 +144,10 @@ function runCodexSession(execute, codexPath, turn, env) {
         early.length = 0;
       } catch (error) {
         diagnostics.error(error.message);
+        const writer = /\bthread\s+["'`]?([0-9a-f-]{36})["'`]?\s+already has an active writer\b/i.exec(error.message);
+        const busy = !submitted && error.rpcMethod === 'thread/resume' && writer?.[1].toLowerCase() === threadId;
         finish({ state: submitted ? 'uncertain' : 'rejected',
-          reason: !submitted && error.rpc && /already has an active writer/i.test(error.message) ? 'thread_busy' :
-            submitted ? 'turn_outcome_unknown' : 'codex_session_failed' });
+          reason: busy ? 'thread_busy' : submitted ? 'turn_outcome_unknown' : 'codex_session_failed' });
       }
     })();
   });
