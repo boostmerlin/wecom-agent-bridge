@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
+const { DatabaseSync } = require('node:sqlite');
 const { parseCommand, createCommandStore } = require('../src/commands.cjs');
 
 test('command aliases, memory scopes, stable deletion IDs and atomic replay', t => {
@@ -37,6 +38,31 @@ test('command aliases, memory scopes, stable deletion IDs and atomic replay', t 
   store.plan('forget', () => ({ reply: store.memory(parse('/forget #1'), scope) }));
   assert.deepEqual(store.plan('forget', () => assert.fail('replayed')), { reply: '已删除记忆 #1' });
   assert.equal(store.append('请测试', dir, route), '请测试');
+});
+
+test('task numbers survive upgrade and replay while remaining scoped to the original conversation', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-task-index-'));
+  const db = new DatabaseSync(path.join(dir, 'commands.sqlite'));
+  const route = { chatType: 'group', chatId: 'team', senderId: 'owner' };
+  const other = { ...route, chatId: 'other' };
+  const target = { queueKey: 'old-queue', workingDir: dir, threadId: 'old-thread' };
+  const media = { total: 0 };
+  db.exec('CREATE TABLE last_tasks(chat TEXT PRIMARY KEY, msg_id TEXT NOT NULL,target TEXT NOT NULL,media TEXT NOT NULL)');
+  db.prepare('INSERT INTO last_tasks VALUES(?,?,?,?)').run(JSON.stringify(['group', 'team']), 'legacy', JSON.stringify(target), JSON.stringify(media));
+  db.close();
+  let store = createCommandStore(dir);
+  t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const migrated = store.task(route);
+  assert.deepEqual(migrated, { number: 1, id: 'legacy', target, media });
+  assert.equal(store.task(other, migrated.number), undefined);
+  store.recordTask(route, 'new', { ...target, queueKey: 'different-queue' }, media);
+  store.recordTask(route, 'legacy', { ...target, threadId: 'other-thread' }, media);
+  store.close();
+  store = createCommandStore(dir);
+  assert.deepEqual(store.recentTasks(route).map(({ id, number }) => [id, number]), [['new', 2], ['legacy', 1]]);
+  assert.deepEqual(store.task(route, migrated.number), migrated);
+  assert.equal(store.task(route).id, 'new');
+  assert.deepEqual(store.recentTasks(other), []);
 });
 
 test('verified WS commands switch the live target in order and acknowledge the original chat', async t => {

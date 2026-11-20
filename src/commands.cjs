@@ -10,7 +10,7 @@ function parseCommand(body) {
   if (body.chattype === 'group') text = text.replace(/^@[^\s]+\s+/, '');
   const decision = /^\/?(允许|拒绝|approve|deny)(?:\s+([a-z0-9]+))?$/i.exec(text);
   if (decision) return { name: /^(允许|approve)$/i.test(decision[1]) ? 'approve' : 'deny', arg: decision[2] || '' };
-  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|history|status|bind|retry|cancel|backend|help|允许|拒绝|approve|deny)(?:\s+([\s\S]*))?$/i.exec(text);
+  const match = /^\/(记住|记忆|memory|忘记|forget|new|cwd|thread|threads|history|status|tasks|bind|retry|cancel|backend|help|允许|拒绝|approve|deny)(?:\s+([\s\S]*))?$/i.exec(text);
   if (!match) return null;
   const name = match[1].toLowerCase();
   const aliases = { memory: '记忆', forget: '忘记', 允许: 'approve', 拒绝: 'deny' };
@@ -28,8 +28,9 @@ const helpText = [
   '/history  列出当前后端最近使用的聊天和工作目录（最多 20 条）',
   '/thread <ID 或链接>  切换聊天',
   '/new  新开聊天；/cwd <绝对目录>  换目录并新开聊天',
-  '/retry  重试本会话上一条任务中确定失败的环节',
-  '/cancel  取消本会话上一条排队或本地执行中的任务，不撤销已有改动',
+  '/tasks  查看当前后端在本会话的最近 10 条任务及编号',
+  '/retry [编号]  重试指定任务中确定失败的环节，省略编号则操作上一条',
+  '/cancel [编号]  取消本地排队或执行中的任务，省略编号则操作上一条',
   '允许 <审批编号> / 拒绝 <审批编号>  回应 Codex / Claude 审批；只有一条待审批时可省略编号',
   '/memory 或 /记忆  查看记忆；后接内容则保存',
   '/忘记 或 /forget <编号或内容>  删除记忆',
@@ -47,6 +48,10 @@ function createCommandStore(directory) {
     CREATE TABLE IF NOT EXISTS target_history (queue_key TEXT PRIMARY KEY, used_order INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS bindings (chat TEXT PRIMARY KEY, target TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS last_tasks (chat TEXT PRIMARY KEY, msg_id TEXT NOT NULL, target TEXT NOT NULL, media TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS tasks (
+      number INTEGER PRIMARY KEY, chat TEXT NOT NULL, msg_id TEXT NOT NULL UNIQUE, target TEXT NOT NULL, media TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tasks_by_chat ON tasks(chat,number DESC);
     CREATE TABLE IF NOT EXISTS notes (
       id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, name TEXT, body TEXT NOT NULL,
       UNIQUE(scope,name)
@@ -65,7 +70,13 @@ function createCommandStore(directory) {
   db.exec(`INSERT OR IGNORE INTO target_history
     SELECT json_extract(target,'$.queueKey'),0 FROM last_tasks
     WHERE json_extract(target,'$.queueKey') IS NOT NULL`);
+  db.exec('INSERT OR IGNORE INTO tasks(chat,msg_id,target,media) SELECT chat,msg_id,target,media FROM last_tasks ORDER BY rowid');
   const notes = db.prepare('SELECT id,name,body FROM notes WHERE scope=? ORDER BY id');
+  const recentTasks = db.prepare('SELECT number,msg_id,target,media FROM tasks WHERE chat=? ORDER BY number DESC LIMIT ?');
+  const numberedTask = db.prepare('SELECT number,msg_id,target,media FROM tasks WHERE chat=? AND number=?');
+  function readTask({ number, msg_id, target, media }) {
+    return { number, id: msg_id, target: JSON.parse(target), media: JSON.parse(media) };
+  }
   function scope(dir, route) {
     const canonical = fs.realpathSync(dir);
     return JSON.stringify([process.platform === 'win32' ? canonical.toLowerCase() : canonical,
@@ -108,9 +119,9 @@ function createCommandStore(directory) {
     recordTask(route, id, target, media) {
       db.exec('BEGIN IMMEDIATE');
       try {
-        db.prepare('INSERT OR REPLACE INTO last_tasks VALUES(?,?,?,?)').run(chatKey(route), id,
+        const inserted = db.prepare('INSERT OR IGNORE INTO tasks(chat,msg_id,target,media) VALUES(?,?,?,?)').run(chatKey(route), id,
           JSON.stringify(target), JSON.stringify(media));
-        db.prepare(`INSERT OR REPLACE INTO target_history
+        if (inserted.changes) db.prepare(`INSERT OR REPLACE INTO target_history
           SELECT ?,COALESCE(MAX(used_order),0)+1 FROM target_history`).run(target.queueKey);
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -123,9 +134,13 @@ function createCommandStore(directory) {
         FROM target_history h JOIN queue_locations q USING(queue_key)
         GROUP BY q.thread_id,q.working_dir ORDER BY lastUsed DESC,q.queue_key LIMIT ?`).all(limit);
     },
-    lastTask(route) {
-      const row = db.prepare('SELECT msg_id,target,media FROM last_tasks WHERE chat=?').get(chatKey(route));
-      return row && { id: row.msg_id, target: JSON.parse(row.target), media: JSON.parse(row.media) };
+    task(route, number) {
+      const chat = chatKey(route);
+      const row = number === undefined ? recentTasks.get(chat, 1) : numberedTask.get(chat, number);
+      return row && readTask(row);
+    },
+    recentTasks(route) {
+      return recentTasks.all(chatKey(route), 10).map(readTask);
     },
     append(text, dir, route) {
       const rows = notes.all(scope(dir, route));

@@ -43,27 +43,31 @@ function openReader(codexPath, workingDir, execute, timeoutMs, diagnosticOptions
   });
 
   const send = message => child.stdin.write(JSON.stringify(message) + '\n');
-  async function request(method, params) {
+  async function request(method, params, signal) {
+    signal?.throwIfAborted();
     if (closed) throw new Error('Codex reply reader disconnected');
     const id = ++nextId;
     let timer;
+    const abort = () => pending?.reject(signal.reason);
     try {
       return await new Promise((resolve, reject) => {
         pending = { id, resolve, reject };
         timer = setTimeout(() => reject(new Error('Codex reply read timed out')), timeoutMs);
+        signal?.addEventListener('abort', abort, { once: true });
         send({ id, method, params });
       });
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
       pending = null;
     }
   }
   return {
-    async initialize() {
+    async initialize(signal) {
       await request('initialize', {
         clientInfo: { name: 'wecom-agent-bridge', version: '1.0' },
         capabilities: { experimentalApi: true },
-      });
+      }, signal);
       send({ method: 'initialized' });
     },
     request,
@@ -121,6 +125,7 @@ function createReplyReader({ codexPath, threadId, workingDir, execute = spawn, t
     const wanted = new Set(tokens);
     const replies = new Map();
     replies.unresolved = new Map();
+    replies.started = new Set();
     if (!wanted.size) return replies;
     const reader = openReader(codexPath, workingDir, execute, timeoutMs);
     const observations = new Map();
@@ -145,6 +150,7 @@ function createReplyReader({ codexPath, threadId, workingDir, execute = spawn, t
     }
     for (const [token, matches] of observations) {
       const results = [...matches.values()];
+      if (matches.size === 1) replies.started.add(token);
       if (results.some(result => !result.reason && !result.text)) continue;
       if (results.length > 1) replies.unresolved.set(token, 'ambiguous_turn');
       else if (results[0].reason) replies.unresolved.set(token, results[0].reason);
@@ -180,8 +186,8 @@ async function listThreads({ codexPath, workingDir, execute = spawn, timeoutMs =
   }
 }
 
-async function threadSnapshot(reader, threadId) {
-  const { thread } = await reader.request('thread/read', { threadId, includeTurns: false });
+async function threadSnapshot(reader, threadId, signal) {
+  const { thread } = await reader.request('thread/read', { threadId, includeTurns: false }, signal);
   if (thread?.id?.toLowerCase() !== threadId.toLowerCase()) throw new Error('Unexpected Codex thread ID');
   return thread;
 }
@@ -205,14 +211,14 @@ async function readThreadCwd(options) {
 async function queueMessage({ codexPath, workingDir, threadId, prompt, replyToken, signal,
   execute = spawn, timeoutMs = 30_000, onDetached, onDiagnostic }) {
   let reader, submitting = false;
-  const cancelled = () => ({ state: 'uncertain', reason: signal.reason === 'bridge_stopped' ? 'bridge_stopped' : 'task_cancelled' });
+  const cancelled = () => ({ state: 'uncertain', reason: 'desktop_queue_cancelled' });
   if (signal?.aborted) return cancelled();
   const clientId = replyToken || randomUUID();
   try {
     reader = openReader(codexPath, workingDir, execute, timeoutMs, { prompt, onDiagnostic });
-    await reader.initialize();
+    await reader.initialize(signal);
     // Queue entries inherit the writer's directory. Validate it before submitting.
-    const { cwd } = await threadSnapshot(reader, threadId);
+    const { cwd } = await threadSnapshot(reader, threadId, signal);
     if (signal?.aborted) return cancelled();
     if (typeof cwd !== 'string' || !isAbsolute(cwd) || relative(realpathSync(workingDir), realpathSync(cwd))) {
       return { state: 'rejected', reason: 'desktop_working_dir_mismatch' };

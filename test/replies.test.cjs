@@ -311,3 +311,20 @@ test('long tasks receive a single progress notice across restart, fast tasks onl
   await until(() => sent.length >= 3);
   assert.deepEqual(sent, [[group, '已投递到 Alpha'], [direct, '快速答复'], [group, '长任务答复']]);
 });
+
+test('desktop progress distinguishes tasks waiting to start from a matching turn already seen', async t => {
+  const { open, add } = fixture(t);
+  const sent = [];
+  const ctrl = open({ progressAfterMs: 20,
+    readReplies: async () => Object.assign(new Map(), { started: new Set(['client-2']) }),
+    sendReply: async (_, text) => sent.push(text) });
+  for (const entry of [1, 2]) {
+    add(ctrl, entry);
+    ctrl.bindQueue(entry, 'client-' + entry);
+    ctrl.trackProgress(entry, false);
+    ctrl.start(entry);
+  }
+  await until(() => sent.length === 2);
+  assert.match(sent[0], /尚未确认开始.*继续/);
+  assert.match(sent[1], /完成后会在这里回复/);
+});

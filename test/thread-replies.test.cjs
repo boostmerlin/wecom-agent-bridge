@@ -5,6 +5,7 @@ const { EventEmitter } = require('node:events');
 const path = require('node:path');
 const { createInterface } = require('node:readline');
 const { PassThrough } = require('node:stream');
+const { setTimeout: delay } = require('node:timers/promises');
 const test = require('node:test');
 const { createReplyReader, readThreadCwd, queueMessage } = require('../src/backends/codex-history.cjs');
 const { createCodexBackend } = require('../src/backends/codex.cjs');
@@ -102,6 +103,17 @@ test('desktop queue refuses a mismatched working directory before submitting', a
   assert.deepEqual(f.methods, ['initialize', 'initialized', 'thread/read']);
 });
 
+test('cancelling a pending desktop lookup closes it before the RPC timeout and never submits', async () => {
+  const controller = new AbortController();
+  const pages = new Map();
+  pages.get = () => { controller.abort('task_cancelled'); };
+  const f = fixture(pages, 1000);
+  const result = await Promise.race([f.queue({ signal: controller.signal }), delay(250, 'lookup stayed open', { ref: false })]);
+  assert.deepEqual(result, { state: 'uncertain', reason: 'desktop_queue_cancelled' });
+  assert.deepEqual(f.methods, ['initialize', 'initialized', 'thread/read']);
+  assert.ok(f.children[0].stopped);
+});
+
 test('reads every cursor for the target, selects only completed explicit finals and exact bridge headers', async () => {
   const pages = new Map([
     [undefined, { result: { data: [
@@ -147,6 +159,7 @@ test('reports a recorded interruption for its exact queue client ID even without
   ], nextCursor: null } }]]));
   const result = await f.read(['client:' + token(12), 'client:' + token(13)]);
   assert.deepEqual([...result.unresolved], [['client:' + token(12), 'turn_interrupted']]);
+  assert.deepEqual([...result.started], ['client:' + token(12)]);
 });
 
 test('resolves only the requested thread directory without a preset cwd or loading its turns', async () => {
@@ -185,6 +198,9 @@ test('Codex status shows the saved title or a short preview with only the last U
   }
   pages.set('thread/read', { result: { thread: { id: threadId, name: null, preview } } });
   assert.equal(await chatTitle(backend, threadId), threadId);
+  const groupStatus = await describeStatus(backend, snapshot, { allowPreview: false });
+  assert.match(groupStatus, /暂无标题 · …7547c8efc9c6/);
+  assert.doesNotMatch(groupStatus, /检查构建结果/);
 });
 
 test('withholds two terminal turns sharing a token and deduplicates repeated pages of the same turn', async () => {

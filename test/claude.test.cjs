@@ -256,6 +256,10 @@ test('Claude status and thread lists show a title or a short body excerpt, inclu
     info = metadata;
     assert.deepEqual(await backend.listThreads('C:/project'), [{ id, name: expected }]);
     assert.equal(await chatTitle(backend, id, { compact: true }), (expected || '暂无标题') + ' · …0123456789ab');
+    assert.equal(await chatTitle(backend, id, { compact: true, allowPreview: false }),
+      (metadata?.customTitle || '暂无标题') + ' · …0123456789ab');
+    assert.deepEqual(await backend.listThreads('C:/project', { allowPreview: false }),
+      [{ id, name: metadata?.customTitle }]);
   }
 });
 

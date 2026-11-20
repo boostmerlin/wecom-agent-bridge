@@ -20,8 +20,8 @@ function parseThreadId(value) {
   return id.toLowerCase();
 }
 
-function sessionTitle(info, fromFirstPrompt) {
-  return info?.customTitle?.trim() || titleFromPreview(info?.summary) || fromFirstPrompt?.(info?.firstPrompt);
+function sessionTitle(info, { allowPreview = true, fromPreview } = {}) {
+  return info?.customTitle?.trim() || (allowPreview ? titleFromPreview(info?.summary) || fromPreview?.(info?.firstPrompt) : undefined);
 }
 
 function childEnvironment() {
@@ -153,13 +153,13 @@ function createClaudeBackend({ claudePath, execute = spawn, loadSessions = () =>
       if (!info?.cwd) throw new Error('找不到 Claude 会话的工作目录，请选择本机已有会话。');
       return info.cwd;
     },
-    async getThreadTitle(id, fromFirstPrompt) {
-      return sessionTitle(await sessionInfo(id), fromFirstPrompt);
+    async getThreadTitle(id, options) {
+      return sessionTitle(await sessionInfo(id), options);
     },
-    async listThreads(workingDir) {
+    async listThreads(workingDir, { allowPreview = true } = {}) {
       const rows = await (await metadata()).listSessions({ dir: workingDir, includeWorktrees: false });
       return rows.filter(row => !row.archived && uuid.test(row.sessionId))
-        .map(row => ({ id: row.sessionId.toLowerCase(), name: sessionTitle(row, titleFromPreview) }));
+        .map(row => ({ id: row.sessionId.toLowerCase(), name: sessionTitle(row, { allowPreview, fromPreview: titleFromPreview }) }));
     },
     submit,
     // External messages never inherit an owner conversation or its approval callback.

@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
-const { chatTitle, describeStatus } = require('./task-status.cjs');
+const { chatTitle, describeStatus, describeTasks } = require('./task-status.cjs');
 const { createDelivery } = require('./delivery.cjs');
 const { formatIncoming } = require('./incoming.cjs');
 const { createMediaStore } = require('./media.cjs');
@@ -52,7 +52,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
   const { taskTimeoutMs } = config;
   let active, commands;
   const workers = new Map();
-  const statusReplies = new Map();
+  const taskReplies = new Map();
   const stateDir = stateDirectory(root, backend);
   fs.mkdirSync(stateDir, { recursive: true });
   const messages = { ...eventMessages, ...backend.eventMessages };
@@ -66,7 +66,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
     process.stdout.write(line);
   }
   async function close() {
-    await Promise.all([...statusReplies.values()].map(item => item.done));
+    await Promise.all([...taskReplies.values()].map(item => item.done));
     await Promise.all([...workers.values()].map(w => w.delivery.close()));
     commands?.close();
   }
@@ -96,7 +96,8 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
         progressAfterMs: config.progressAfterMs,
         taskTimeoutMs, requestApproval,
         progressText: async route => {
-          const title = route.senderId === config.ownerId ? await chatTitle(backend, current.threadId) : backend.name;
+          const title = route.senderId === config.ownerId
+            ? await chatTitle(backend, current.threadId, { allowPreview: route.chatType === 'single' }) : backend.name;
           return '已投递到 ' + title + '，完成后会在这里回复。';
         },
         log: (event, details) => log(event, details, current),
@@ -134,23 +135,29 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
       origin.delivery.enqueue(plan.id, plan.reply, plan.route.chatType, plan.route, plan.requestId, plan.route.senderId, true);
       commands.finish(plan.id);
     }
-    // Snapshot status in receive order. Only title enrichment and its reply run
+    // Snapshot task states in receive order. Only title enrichment and its reply run
     // outside that sequence, so a slow backend cannot stall other conversations.
-    function sendStatus(id, origin, route, requestId, snapshot) {
-      if (statusReplies.has(id)) return statusReplies.get(id).done;
-      const done = describeStatus(backend, snapshot).then(reply => {
+    function sendTaskReply(id, origin, route, requestId, describe) {
+      if (taskReplies.has(id)) return taskReplies.get(id).done;
+      const done = describe().then(reply => {
         applyPlan(commands.plan(id, () => ({ id, origin: origin.queueKey, route, requestId, reply })));
       }).catch(() => {
         log('receive_error', { wecomRequestId: requestId }, origin);
         onError();
-      }).finally(() => statusReplies.delete(id));
-      statusReplies.set(id, { origin, done });
+      }).finally(() => taskReplies.delete(id));
+      taskReplies.set(id, { origin, done });
       return done;
+    }
+
+    function taskSnapshot(task, route) {
+      const queue = openQueue(task.target);
+      return { ...task.target, number: task.number, threadId: task.target.threadId ?? queue.threadId, media: task.media,
+        state: queue.delivery.taskState(task.id, route) };
     }
 
     async function retireIdle() {
       for (const [key, w] of workers) {
-        if (w !== active && ![...statusReplies.values()].some(item => item.origin === w) && w.delivery.idle()) {
+        if (w !== active && ![...taskReplies.values()].some(item => item.origin === w) && w.delivery.idle()) {
           await w.delivery.close();
           workers.delete(key);
           commands.untrack(key);
@@ -194,7 +201,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
       const cmd = parseCommand(frame.body);
       const requestId = frame.headers?.req_id;
       const repairingBinding = cmd?.name === 'bind' && !!cmd.arg;
-      if (targetError && !repairingBinding && !['help', 'history', 'status', 'retry', 'cancel', 'backend', 'approve', 'deny'].includes(cmd?.name)) {
+      if (targetError && !repairingBinding && !['help', 'history', 'status', 'tasks', 'retry', 'cancel', 'backend', 'approve', 'deny'].includes(cmd?.name)) {
         if (route) origin.delivery.enqueue(message.id, targetError,
           message.chatType, route, requestId, frame.body.from.userid, true);
         commands.finish(message.id);
@@ -202,27 +209,37 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
       }
       if (cmd && route) {
         let target, reply, unbind = false;
+        const titleOptions = { allowPreview: route.chatType === 'single' };
         if (localReply !== undefined) reply = localReply;
         else if (cmd.name === 'help') reply = cmd.arg ? '用法：/help' : helpText;
         else if (!owner) reply = '此指令仅限机器人绑定的本人使用。';
-        else if (['status', 'retry', 'cancel'].includes(cmd.name)) {
-          const last = commands.lastTask(route);
-          if (cmd.arg) reply = '用法：/' + cmd.name;
-          else if (cmd.name === 'cancel') {
-            reply = last ? openQueue(last.target).delivery.cancelTask(message.id, last.id, route) : '本会话尚无任务。';
-          }
-          else if (cmd.name === 'retry') {
-            reply = last ? openQueue(last.target).delivery.retryTask(message.id, last.id, route, last.target.workingDir) : '本会话尚无任务。';
+        else if (cmd.name === 'retry' || cmd.name === 'cancel') {
+          const number = cmd.arg ? Number(cmd.arg.replace(/^#/, '')) : undefined;
+          if (cmd.arg && (!/^#?[1-9]\d*$/.test(cmd.arg) || !Number.isSafeInteger(number))) {
+            reply = '用法：/' + cmd.name + ' [任务编号]。发送 /tasks 查看编号。';
           } else {
-            let previous;
-            if (last) {
-              const queue = openQueue(last.target);
-              previous = { ...last.target, threadId: last.target.threadId ?? queue.threadId, media: last.media,
-                state: queue.delivery.taskState(last.id, route) };
+            const task = commands.task(route, number);
+            if (!task) reply = number ? '当前后端在本会话未找到任务 #' + number + '。' : '本会话尚无任务。';
+            else {
+              const { delivery } = openQueue(task.target);
+              reply = cmd.name === 'retry' ? delivery.retryTask(message.id, task.id, route, task.target.workingDir)
+                : delivery.cancelTask(message.id, task.id, route);
             }
-            const done = sendStatus(message.id, origin, route, requestId, {
-              target: targetRecord(next), sources, error: targetError, last: previous,
-            });
+          }
+        }
+        else if (cmd.name === 'status' || cmd.name === 'tasks') {
+          if (cmd.arg) reply = '用法：/' + cmd.name;
+          else {
+            let describe;
+            if (cmd.name === 'tasks') {
+              const tasks = commands.recentTasks(route).map(task => taskSnapshot(task, route));
+              describe = () => describeTasks(backend, tasks, titleOptions);
+            } else {
+              const last = commands.task(route);
+              const snapshot = { target: targetRecord(next), sources, error: targetError, last: last && taskSnapshot(last, route) };
+              describe = () => describeStatus(backend, snapshot, titleOptions);
+            }
+            const done = sendTaskReply(message.id, origin, route, requestId, describe);
             await retireIdle();
             return { done };
           }
@@ -254,7 +271,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
           if (cmd.arg) reply = '用法：/threads';
           else {
             try {
-              const threads = await backend.listThreads(origin.workingDir);
+              const threads = await backend.listThreads(origin.workingDir, titleOptions);
               const rows = threads.map(({ id, name }) => {
                 const title = name?.trim().replace(/\s+/g, ' ') || '未命名聊天';
                 return (id === origin.threadId ? '【当前】' : '') + title + '\n' + id;
@@ -269,7 +286,7 @@ async function createBackendRuntime({ config, backend, initialTarget, defaults, 
             if (cmd.name === 'thread') {
               const threadId = backend.parseThreadId(cmd.arg);
               const [directory, title] = await Promise.all([
-                backend.getWorkingDir(threadId), chatTitle(backend, threadId, { compact: true }),
+                backend.getWorkingDir(threadId), chatTitle(backend, threadId, { ...titleOptions, compact: true }),
               ]);
               const workingDir = checkWorkingDir(directory);
               target = { threadId, workingDir };

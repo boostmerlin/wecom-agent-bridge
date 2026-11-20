@@ -55,7 +55,9 @@ test('another backend handles WeCom commands, new turns and replies across a res
       assert.equal(id, 'chat/b');
       return root;
     },
-    getThreadTitle: async id => ({ 'chat/a': 'Alpha', 'chat/b': 'Beta' })[id],
+    getThreadTitle: async (id, { allowPreview }) => ({
+      'chat/a': 'Alpha', 'chat/b': 'Beta', 'chat/c': allowPreview ? '私聊预览样本' : undefined,
+    })[id],
     listThreads: async dir => {
       assert.equal(dir, root);
       return [{ id: 'chat/a', name: 'Alpha' }, { id: 'chat/b', name: 'Beta' }];
@@ -76,12 +78,12 @@ test('another backend handles WeCom commands, new turns and replies across a res
     await main.runBridge({ backend, ...await main.resolveTarget(backend), botId: 'bot', ownerId: 'me', secret: 'test' });
   }
   let serial = 0;
-  async function send(text, group = false) {
+  async function send(text, group = false, matches = () => true) {
     const route = { chatId: group ? 'team' : 'me', chatType: group ? 'group' : 'single', senderId: 'me' };
     const signal = AbortSignal.timeout(4000);
     const done = new Promise((resolve, reject) => {
       function listen(origin, answer) {
-        if (origin.chatId !== route.chatId) return;
+        if (origin.chatId !== route.chatId || !matches(answer)) return;
         replies.off('sent', listen);
         resolve([origin, answer]);
       }
@@ -112,10 +114,12 @@ test('another backend handles WeCom commands, new turns and replies across a res
   assert.match(calls[1].prompt, /企微群聊/);
   const before = calls.length;
   const help = await send('/help', true);
-  for (const name of ['/status', '/bind', '/retry', '/threads', '/memory', '/forget']) assert.ok(help.includes(name));
+  for (const name of ['/status', '/tasks', '/bind', '/retry', '/threads', '/memory', '/forget']) assert.ok(help.includes(name));
   assert.ok(!help.includes('/save'));
   const groupStatus = await send('/status', true);
   assert.match(groupStatus, /上一条任务 → 暂无标题 · chat\/c/);
+  assert.doesNotMatch(groupStatus, /私聊预览样本/);
+  assert.doesNotMatch(await send('/tasks', true), /私聊预览样本/);
   assert.match(groupStatus, /投递：已完成；回复：已回发/);
   assert.match(groupStatus, /附件：无/);
   assert.match(await send('/bind', true), /本会话已绑定/);
@@ -167,6 +171,12 @@ test('another backend handles WeCom commands, new turns and replies across a res
   await stop('restart');
   await start();
   assert.match(await send('/status', true), /投递：已完成；回复：失败/);
+  const failedTask = (await send('/tasks', true)).match(/#(\d+)[^\n]*\n[^\n]*回复：失败/)?.[1];
+  assert.ok(failedTask);
+  assert.doesNotMatch(await send('/tasks'), new RegExp('^#' + failedTask + '\\b', 'm'));
+  assert.match(await send('/retry #' + failedTask), /未找到/);
+  assert.match(await send('/cancel ' + failedTask), /未找到/);
+  assert.equal(await send('newer group task', true), '收到');
   const turnsBeforeRetry = calls.length;
   const responses = [];
   const retried = new Promise(resolve => {
@@ -178,12 +188,54 @@ test('another backend handles WeCom commands, new turns and replies across a res
     replies.on('sent', collect);
   });
   socket.emit('message', { body: { msgid: String(++serial), chattype: 'group', chatid: 'team',
-    from: { userid: 'me' }, msgtype: 'text', text: { content: '/retry' } } });
+    from: { userid: 'me' }, msgtype: 'text', text: { content: '/retry #' + failedTask } } });
   await retried;
   assert.ok(responses.includes('历史结果'));
   assert.ok(responses.some(text => text.includes('未发出的分段')));
   assert.equal(calls.length, turnsBeforeRetry);
   assert.match(await send('/status', true), /投递：已完成；回复：已回发/);
+  assert.match(await send('/tasks', true), new RegExp('#' + failedTask + '[^\\n]*\\n[^\\n]*回复：已回发'));
+
+  // Keep the first task in flight so numbered cancellation can skip the newest task.
+  const submit = backend.submit;
+  backend.supportsCancellation = true;
+  const holding = Promise.withResolvers();
+  backend.submit = async turn => {
+    if (!turn.prompt.includes('hold for numbered cancel')) return submit(turn);
+    turn.onStarted();
+    await new Promise(resolve => {
+      turn.signal.addEventListener('abort', resolve, { once: true });
+      holding.resolve();
+    });
+    return { state: 'uncertain', reason: turn.signal.reason };
+  };
+  const emitGroup = (content, userid = 'me') => socket.emit('message', { body: {
+    msgid: String(++serial), chattype: 'group', chatid: 'team', from: { userid }, msgtype: 'text', text: { content },
+  } });
+  emitGroup('hold for numbered cancel');
+  await holding.promise;
+  emitGroup('queued task to cancel');
+  emitGroup('newest task to preserve');
+  const activeTasks = await send('/tasks', true);
+  const [newest, queued, running] = [...activeTasks.matchAll(/^#(\d+)[^\n]*\n(投递：[^\n]+)/gm)];
+  assert.match(newest[2], /本地排队/);
+  assert.match(queued[2], /本地排队/);
+  assert.match(running[2], /正在处理/);
+  assert.match(await send('/cancel 1e3', true), /用法/);
+  assert.equal(await send('/cancel #' + queued[1], true, text => text.startsWith('已取消尚未执行')), '已取消尚未执行的任务。');
+  assert.match(await send('/tasks', true), new RegExp('#' + queued[1] + '[^\\n]*\\n投递：已取消'));
+  const newestReply = new Promise(resolve => {
+    function onSent(route, text) {
+      if (route.chatId !== 'team' || text !== '收到') return;
+      replies.off('sent', onSent);
+      resolve();
+    }
+    replies.on('sent', onSent);
+  });
+  assert.match(await send('/cancel ' + running[1], true, text => text.startsWith('已请求取消')), /已请求取消/);
+  await newestReply;
+  assert.ok(calls.some(turn => turn.prompt.includes('newest task to preserve')));
+  assert.ok(!calls.some(turn => turn.prompt.includes('queued task to cancel')));
 
   // Both snapshots refer to one thread. The group is answered before the slow status.
   let lookups = 0;

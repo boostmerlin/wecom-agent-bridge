@@ -55,7 +55,7 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
   let created = 0, inFlight = 0, maxInFlight = 0;
   const sessionDirs = new Map([[sessionB, root]]);
   const backend = createClaudeBackend({ claudePath: 'fixture', loadSessions: async () => ({
-    getSessionInfo: async id => sessionDirs.has(id) ? { sessionId: id, cwd: sessionDirs.get(id), summary: 'Claude 会话' } : undefined,
+    getSessionInfo: async id => sessionDirs.has(id) ? { sessionId: id, cwd: sessionDirs.get(id), customTitle: 'Claude 会话' } : undefined,
     listSessions: async ({ dir }) => [...sessionDirs].filter(([, cwd]) => cwd === dir).map(([sessionId, cwd]) =>
       ({ sessionId, cwd, summary: '企微群聊 · 本人  **正文**  first  **特殊要求** - 简洁' })),
   }), execute(file, args, options) {
@@ -129,7 +129,7 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
   assert.equal(calls[0].resumed, false);
   assert.equal(calls[0].cwd, project);
   assert.match(calls[0].prompt, /\*\*正文\*\*\n\nfirst\n\n\*\*特殊要求\*\*\n- /);
-  assert.equal(await send('/threads', { group: true }), project + ' · 1 个聊天\n\n【当前】first\n' + sessionA);
+  assert.equal(await send('/threads', { group: true }), project + ' · 1 个聊天\n\n【当前】未命名聊天\n' + sessionA);
   const status = await send('/status', { group: true });
   assert.match(status, /后端：Claude Code\n下一条消息 → Claude 会话 · …0123456789ab/);
   assert.match(status, /上一条任务 → Claude 会话 · …0123456789ab[\s\S]*回复：已回发/);

@@ -277,7 +277,7 @@ function createCodexBackend({ codexPath, execute = spawn, wakeDesktop = requestD
       desktop_wake_failed: "唤醒请求失败，消息已在 Codex 队列中。",
     },
     parseThreadId,
-    async getThreadTitle(threadId, fromPreview) {
+    async getThreadTitle(threadId, { fromPreview } = {}) {
       const { name, preview } = await readThread({ codexPath, threadId, execute, timeoutMs: 800 });
       return name?.trim() || fromPreview?.(preview);
     },

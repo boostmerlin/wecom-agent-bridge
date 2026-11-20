@@ -104,6 +104,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
   function unmatched(entry, reason = missingReceiptReason, message) {
     const stopped = {
       turn_interrupted: 'Codex 已中断本次任务。任务可能已产生部分改动，请查看目标聊天。',
+      desktop_queue_cancelled: '本次任务已在投递前停止，尚未发送到 Codex。',
       task_cancelled: '已取消本次任务的本地执行。已产生的改动不会撤销，桥接不会自动重跑。',
       task_timeout: '本次任务执行超时，已停止本地进程。任务可能已产生部分改动，桥接不会自动重跑。',
       bridge_stopped: '桥接停止时中断了本次任务。任务可能已产生部分改动，重启后不会自动重跑。',
@@ -179,6 +180,11 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
       for (const [index, { entry }] of waiting.entries()) {
         const token = keys[index];
         const reason = results.unresolved?.get(token);
+        if (results.started?.has(token)) {
+          const changed = sql.run`INSERT INTO bridge_progress(entry,started) VALUES(${entry},1)
+            ON CONFLICT(entry) DO UPDATE SET started=1 WHERE started=0`.changes;
+          progress = !!changed || progress;
+        }
         if (reason === 'turn_failed' || reason === 'turn_interrupted' || reason === 'ambiguous_turn') {
           progress = unmatched(entry, reason) || progress;
         } else if (results.has(token)) {
@@ -243,7 +249,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     catch { emit('progress_failed', { entry, reason: 'progress_storage_error' }); }
   }
   async function sendProgress() {
-    const row = sql.get`SELECT p.entry,p.deferred, r.state, r.chat_type, r.chat_id, r.sender_id FROM bridge_progress p
+    const row = sql.get`SELECT p.entry,p.deferred, r.state, r.queue_id, r.chat_type, r.chat_id, r.sender_id FROM bridge_progress p
       JOIN bridge_replies r ON r.entry=p.entry WHERE p.due<=${Date.now()}
       AND r.state IN ('registered','waiting') ORDER BY p.due LIMIT 1`;
     if (!row) return;
@@ -251,9 +257,12 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     try {
       // Check before progress notices even when history polling has backed off.
       if (row.state === 'waiting') await poll(true);
+      const awaitingStart = row.queue_id && !sql.get`SELECT started FROM bridge_progress WHERE entry=${row.entry}`?.started;
       const text = row.deferred
         ? '桥接暂时无法启动处理程序，消息已保留，会自动重试。请勿重复发送。'
-        : await progressText(route);
+        : awaitingStart
+          ? '消息已进入 Codex 队列，尚未确认开始执行。如果桌面端显示队列暂停，请在目标聊天点「继续」。'
+          : await progressText(route);
       // A final may arrive during the title lookup. Reserve before sending so a
       // restart cannot produce a duplicate progress message.
       if (closed || !sql.run`UPDATE bridge_progress SET due=NULL WHERE entry=${row.entry} AND due IS NOT NULL
