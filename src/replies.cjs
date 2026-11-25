@@ -210,10 +210,16 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
       if (Number.isSafeInteger(error?.businessCode) && error.businessCode >= 0 && error.businessCode <= 2147483647) {
         details.businessCode = error.businessCode;
       }
+      if (error?.operation === 'send' || error?.operation === 'list_sessions') details.operation = error.operation;
       const mappingExhausted = error?.code === 'REPLY_ROUTE_UNMAPPED' && row.attempts >= 2;
       if (error?.definitelyUnsent === true && error.temporary === true && !mappingExhausted) {
         const wait = Math.min(300000, retryBaseMs * 2 ** Math.min(row.attempts, 16));
         sql.run`UPDATE bridge_replies SET state='ready',retry_at=${Date.now() + wait},attempts=attempts+1 WHERE entry=${row.entry}`;
+        if (error.authorizationIssue === 'expired') {
+          details.message = '企微接口提示授权已过期。请运行 wecom-cli auth init 重新授权。桥接将自动重试回发。';
+        } else if (error.authorizationIssue === 'rejected') {
+          details.message = '企微接口拒绝回发授权（850003）。可运行 wecom-cli auth show --status 检查授权状态。桥接将自动重试回发。';
+        }
         emit('reply_deferred', { ...details, retryMs: wait });
       } else {
         const state = error?.definitelyUnsent === true ? 'failed' : 'uncertain';

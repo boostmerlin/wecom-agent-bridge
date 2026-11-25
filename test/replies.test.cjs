@@ -140,6 +140,29 @@ test('a confirmed interruption releases the delivery hold and replies to the ori
   assert.match(sent[0].text, /Codex.*中断/);
 });
 
+test('authorization logs use safe diagnostics and preserve automatic retry', async t => {
+  const { events, open, add } = fixture(t);
+  let calls = 0;
+  const ctrl = open({ retryBaseMs: 10000, sendReply: async () => {
+    throw Object.assign(new Error('private server detail'), {
+      code: 'REPLY_REJECTED', businessCode: 850003, definitelyUnsent: true, temporary: true,
+      authorizationIssue: calls++ ? 'rejected' : 'expired', operation: 'send',
+    });
+  } });
+  for (const entry of [1, 2]) {
+    add(ctrl, entry);
+    ctrl.ready(entry, 'fixture');
+  }
+  await until(() => events.filter(event => event.event === 'reply_deferred').length === 2);
+  const [expired, rejected] = events.filter(event => event.event === 'reply_deferred');
+  assert.match(expired.message, /授权已过期.*auth init.*重试/);
+  assert.match(rejected.message, /授权.*auth show --status.*重试/);
+  assert.doesNotMatch(rejected.message, /已过期/);
+  assert.equal(expired.operation, 'send');
+  assert.equal(expired.retryMs, 10000);
+  assert.ok(!JSON.stringify(events).includes('private server detail'));
+});
+
 test('a confirmed temporary failure resumes from the unsent part on restart, with persisted backoff', async t => {
   const { events, open, add } = fixture(t);
   const attempts = [];

@@ -78,3 +78,20 @@ test('preflight failures and an executable that never starts are not_sent', asyn
   const missing = fixture({ send: { exitCode: null, stdout: '', spawnError: 'ENOENT' } });
   await assert.rejects(missing.sender(owner, 'fixture'), { outcome: 'not_sent', code: 'REPLY_CLI_UNAVAILABLE' });
 });
+
+test('authorization expiry requires an explicit WeCom error message', async () => {
+  for (const [errmsg, authorizationIssue] of [
+    ['Authorization expired (callid: secret-reference)', 'expired'],
+    ['授权已过期', 'expired'],
+    ['no authority', 'rejected'],
+    ['authorization expired status is unknown', 'rejected'],
+    [undefined, 'rejected'],
+  ]) {
+    const { sender } = fixture({ send: { exitCode: 1, stdout: JSON.stringify({ errcode: 850003, errmsg }) } });
+    await assert.rejects(sender(owner, 'fixture'), error =>
+      error.code === 'REPLY_REJECTED' && error.businessCode === 850003 && error.temporary &&
+      error.authorizationIssue === authorizationIssue && error.operation === 'send' && !error.message.includes('secret-reference'));
+  }
+  const preflight = fixture({ list: { exitCode: 1, stdout: '{"errcode":850003,"errmsg":"authorization expired"}' } });
+  await assert.rejects(preflight.sender(group, 'fixture'), { authorizationIssue: 'expired', operation: 'list_sessions' });
+});

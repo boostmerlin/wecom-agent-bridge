@@ -60,7 +60,14 @@ function parseResult(result, sending) {
   // A positive backend error is an explicit rejection. Transport errors or a
   // contradictory success/exit status cannot prove that sending did not occur.
   if (response.success !== true && Number.isInteger(response.errcode) && response.errcode > 0) {
-    throw new ReplyError('REPLY_REJECTED', 'WeCom rejected the operation. Check the relevant authorization.', 'not_sent', response.errcode);
+    const error = new ReplyError('REPLY_REJECTED', 'WeCom rejected the operation.', 'not_sent', response.errcode);
+    error.operation = sending ? 'send' : 'list_sessions';
+    if (response.errcode === 850003) {
+      const message = typeof response.errmsg === 'string' ? response.errmsg.trim() : '';
+      const expired = /^(?:authorization (?:has )?expired|授权(?:已)?过期)(?:\s*\(callid:[^)]*\))?[.。]?$/i.test(message);
+      error.authorizationIssue = expired ? 'expired' : 'rejected';
+    }
+    throw error;
   }
   if (result.exitCode !== 0 || response.error) {
     throw new ReplyError('REPLY_CLI_FAILED', 'WeCom CLI did not confirm the operation.', outcome);
