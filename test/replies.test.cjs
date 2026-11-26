@@ -351,3 +351,46 @@ test('desktop progress distinguishes tasks waiting to start from a matching turn
   assert.match(sent[0], /尚未确认开始.*继续/);
   assert.match(sent[1], /完成后会在这里回复/);
 });
+
+test('sends the default receipt as soon as a local turn starts or a desktop queue accepts it', async t => {
+  const { open, add } = fixture(t);
+  const sent = [];
+  const history = Promise.withResolvers();
+  const reading = Promise.withResolvers();
+  const ctrl = open({
+    readReplies: () => { reading.resolve(); return history.promise; },
+    progressText: async () => '已投递到测试聊天，完成后会在这里回复。',
+    sendReply: async (route, text) => sent.push([route, text]),
+  });
+  try {
+    add(ctrl, 3);
+    ctrl.start(3, { blocking: false });
+    await reading.promise;
+    add(ctrl, 1, direct);
+    ctrl.trackProgress(1, true);
+    await until(() => sent.length === 1);
+    add(ctrl, 2, group);
+    ctrl.bindQueue(2, 'desktop-client');
+    ctrl.start(2);
+    ctrl.trackProgress(2, false);
+    await until(() => sent.length === 2);
+    assert.deepEqual(sent[0], [direct, '已投递到测试聊天，完成后会在这里回复。']);
+    assert.deepEqual(sent[1][0], group);
+    assert.match(sent[1][1], /已投递到测试聊天.*\n.*尚未确认开始.*继续/);
+  } finally {
+    history.resolve(new Map());
+  }
+});
+
+test('recovery after a temporary launch failure still sends the confirmed delivery receipt', async t => {
+  const { open, add } = fixture(t);
+  const sent = [];
+  const ctrl = open({ sendReply: async (_, text) => sent.push(text) });
+  add(ctrl, 1);
+  ctrl.trackProgress(1, false, true);
+  await until(() => sent.length === 1);
+  assert.match(sent[0], /暂时无法启动/);
+  ctrl.trackProgress(1, true);
+  await until(() => sent.length === 2);
+  assert.match(sent[1], /已投递/);
+});

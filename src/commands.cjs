@@ -35,7 +35,7 @@ const helpText = [
   '/memory 或 /记忆  查看记忆；后接内容则保存',
   '/忘记 或 /forget <编号或内容>  删除记忆',
   '绑定后切换目录或聊天只影响本会话。管理指令限机器人绑定的本人使用。',
-].join('\n');
+].join('\n\n');
 
 function chatKey(route) { return JSON.stringify([route.chatType, route.chatId]); }
 

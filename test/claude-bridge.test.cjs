@@ -120,7 +120,8 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
     return id;
   }
   async function send(text, options = {}) {
-    const reply = wait('sent', route => route.chatId === (options.group ? 'team' : options.sender || 'me'));
+    const reply = wait('sent', (route, text) =>
+      route.chatId === (options.group ? 'team' : options.sender || 'me') && !text.startsWith('已投递到 '));
     emit(text, options);
     return (await reply)[1];
   }
@@ -136,7 +137,7 @@ test('Claude bridge routes replies, resumes after restart and isolates Codex sta
   assert.ok(!status.includes(sessionA));
   assert.match(await send('/threads'), new RegExp(sessionA));
   assert.match(await send('/memory 回复语言 = 中文'), /已记住/);
-  const pair = wait('sent', route => route.chatId === 'me');
+  const pair = wait('sent', (route, text) => route.chatId === 'me' && text === '收到');
   const duplicate = emit('second');
   emit('duplicate must not execute', { id: duplicate });
   await pair;

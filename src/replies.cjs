@@ -33,7 +33,7 @@ function* splitMarkdown(text, maxBytes) {
 // readReplies/ready supply final text that the caller has selected for publication
 // to this route. Tokens correlate turns; they do not confer permission to publish.
 function createReplies({ db, readReplies, replyKey = id => id, missingReceiptReason = 'missing_backend_receipt', sendReply, log = () => {}, onTurnResolved = () => {},
-  progressText = async () => '任务已投递，完成后会在这里回复。', progressAfterMs = 60000,
+  progressText = async () => '任务已投递，完成后会在这里回复。', progressAfterMs = 0,
   chunkBytes = 6144, pollMs = 3000, maxPollMs = 60000, turnHoldMs = 300000, retryBaseMs = 3000 }) {
   if ((readReplies && typeof readReplies !== 'function') || typeof sendReply !== 'function') throw new TypeError('Missing reply adapter');
   if (!Number.isInteger(chunkBytes) || chunkBytes < 4 || chunkBytes > 20480) throw new RangeError('Invalid UTF-8 chunk size');
@@ -88,7 +88,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     db.exec('ROLLBACK TO bridge_recover_match_failures; RELEASE bridge_recover_match_failures');
     throw error;
   }
-  let closed = false, closePromise, worker = null, timer, again = false, nextPoll = 0, pollDelay = pollMs, storageRetryAt = 0;
+  let closed = false, closePromise, worker = null, historyWorker, timer, again = false, nextPoll = 0, pollDelay = pollMs, storageRetryAt = 0;
   const emit = (event, details) => { try { log(event, details); } catch {} };
   function released(entry, reason) {
     queueMicrotask(() => { if (!closed) { try { onTurnResolved(entry, reason); } catch {} } });
@@ -167,10 +167,19 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     wake();
     return true;
   }
-  async function poll(force = false) {
-    if (!readReplies) return;
+  function poll(force = false) {
+    if (closed || !readReplies) return;
+    if (historyWorker) return historyWorker;
+    if (!force && nextPoll > Date.now()) return;
     const waiting = sql.all`SELECT entry,queue_id,token FROM bridge_replies WHERE state='waiting' ORDER BY entry`;
-    if (!waiting.length || (!force && nextPoll > Date.now())) return;
+    if (!waiting.length) return;
+    historyWorker = readHistory(waiting).finally(() => {
+      historyWorker = undefined;
+      wake();
+    });
+    return historyWorker;
+  }
+  async function readHistory(waiting) {
     let progress = false;
     try {
       const keys = waiting.map(row => row.queue_id ? replyKey(row.queue_id) : row.token);
@@ -246,7 +255,9 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     try {
       if (!tokenFor(entry)) return;
       sql.run`INSERT INTO bridge_progress(entry,due,started,deferred) VALUES(${entry},${Date.now() + (deferred ? 0 : progressAfterMs)},${Number(started)},${Number(deferred)})
-        ON CONFLICT(entry) DO UPDATE SET started=MAX(started,excluded.started)`;
+        ON CONFLICT(entry) DO UPDATE SET started=MAX(started,excluded.started),
+          due=CASE WHEN deferred=1 AND excluded.deferred=0 THEN excluded.due ELSE due END,
+          deferred=MIN(deferred,excluded.deferred)`;
       wake();
     } catch { emit('progress_failed', { entry, reason: 'progress_storage_error' }); }
   }
@@ -258,35 +269,38 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     const row = sql.get`SELECT p.entry,p.deferred, r.state, r.queue_id, r.chat_type, r.chat_id, r.sender_id FROM bridge_progress p
       JOIN bridge_replies r ON r.entry=p.entry WHERE p.due<=${Date.now()}
       AND r.state IN ('registered','waiting') ORDER BY p.due LIMIT 1`;
-    if (!row) return;
+    if (!row) return false;
     const route = { chatType: row.chat_type, chatId: row.chat_id, senderId: row.sender_id };
     try {
-      // Check before progress notices even when history polling has backed off.
-      if (row.state === 'waiting') await poll(true);
+      // A delayed notice can check for a final first. A delivery receipt must
+      // be able to go out before the desktop history becomes available.
+      if (progressAfterMs > 0 && row.state === 'waiting' && !row.deferred) await poll(true);
       const awaitingStart = row.queue_id && !sql.get`SELECT started FROM bridge_progress WHERE entry=${row.entry}`?.started;
       const text = row.deferred
         ? '桥接暂时无法启动处理程序，消息已保留，会自动重试。请勿重复发送。'
-        : awaitingStart
-          ? '消息已进入 Codex 队列，尚未确认开始执行。如果桌面端显示队列暂停，请在目标聊天点「继续」。'
-          : await progressText(route);
+        : await progressText(route) + (awaitingStart
+          ? '\n消息已进入 Codex 队列，尚未确认开始执行。如果桌面端显示队列暂停，请在目标聊天点「继续」。'
+          : '');
       // A final may arrive during the title lookup. Reserve before sending so a
       // restart cannot produce a duplicate progress message.
       if (closed || !sql.run`UPDATE bridge_progress SET due=NULL WHERE entry=${row.entry} AND due IS NOT NULL
-        AND EXISTS (SELECT 1 FROM bridge_replies WHERE entry=${row.entry} AND state IN ('registered','waiting'))`.changes) return;
+        AND EXISTS (SELECT 1 FROM bridge_replies WHERE entry=${row.entry} AND state IN ('registered','waiting'))`.changes) return true;
       await sendReply(route, text);
       emit('progress_sent', { entry: row.entry });
     } catch {
       finishProgress(row.entry);
       emit('progress_failed', { entry: row.entry });
+      return false;
     }
+    return true;
   }
   async function drain() {
     const expired = sql.all`UPDATE bridge_replies SET block_until=NULL
       WHERE state='waiting' AND block_until<=${Date.now()} RETURNING entry`;
     for (const { entry } of expired) released(entry, 'hold_expired');
     while (!closed && await sendNext()) { /* Each acknowledged chunk commits before the next send. */ }
-    if (!closed) await poll();
-    if (!closed) await sendProgress();
+    while (!closed && await sendProgress()) { /* Send due receipts before reading history. */ }
+    if (!closed) poll();
   }
   function arm() {
     if (closed) return;
@@ -296,7 +310,8 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
       const retries = sql.get`SELECT MIN(retry_at) AS due FROM bridge_replies WHERE state='ready'`;
       const progress = sql.get`SELECT MIN(p.due) AS due FROM bridge_progress p JOIN bridge_replies r ON r.entry=p.entry
         WHERE p.due IS NOT NULL AND r.state IN ('registered','waiting')`;
-      const times = [progress.due, retries.due, backlog.deadline, backlog.n && readReplies ? nextPoll : null].filter(value => value !== null);
+      const pollDue = backlog.n && readReplies && !historyWorker ? nextPoll : null;
+      const times = [progress.due, retries.due, backlog.deadline, pollDue].filter(value => value !== null);
       if (!times.length) return;
       due = Math.max(storageRetryAt, Math.min(...times));
     } catch { due = Date.now() + retryBaseMs; }
@@ -321,7 +336,7 @@ function createReplies({ db, readReplies, replyKey = id => id, missingReceiptRea
     if (closePromise) return closePromise;
     closed = true;
     clearTimeout(timer);
-    closePromise = Promise.resolve(worker).finally(() => {
+    closePromise = Promise.all([worker, historyWorker]).finally(() => {
       for (const statement of statements.values()) statement.close?.();
       statements.clear();
     });

@@ -234,7 +234,7 @@ test('a crashed in-flight worker is quarantined; a different thread has its own 
   await other.delivery.close();
 });
 
-test('correlates the group turn queued in Codex, sends only its concise final, and ignores redelivery', async t => {
+test('acknowledges the Codex queue and correlates its final without replaying a duplicate delivery', async t => {
   const f = fixture(t);
   const route = { chatType: 'group', chatId: 'group-A', senderId: 'owner' };
   let marker, prompt;
@@ -266,7 +266,10 @@ test('correlates the group turn queued in Codex, sends only its concise final, a
   assert.match(prompt, /\n- 正文指定的内容或格式，按要求完整给出/);
   assert.match(prompt, /\n- 最终答复只在这里给出，由桥接发回原企微会话/);
   assert.doesNotMatch(prompt, /wecom-request/);
-  assert.deepEqual(sent, [[route, '核心结论']]);
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0][0], route);
+  assert.match(sent[0][1], /已投递.*\n.*尚未确认开始/);
+  assert.deepEqual(sent[1], [route, '核心结论']);
   assert.equal(p.delivery.taskState('ws-id', route).delivery, 'completed');
   for (const { details } of p.log.filter(row => row.details?.entry === 1)) {
     assert.match(details.requestId, /^[a-f0-9]{32}$/);
@@ -296,7 +299,7 @@ test('direct execution sends the final output file to the original conversation'
   const done = p.event('reply_sent');
   p.delivery.enqueue('direct-id', '执行任务', 'single', route);
   await done;
-  assert.deepEqual(sent, [[route, '最终结果']]);
+  assert.deepEqual(sent, [[route, '任务已投递，完成后会在这里回复。'], [route, '最终结果']]);
 });
 
 test('fresh inbox creates one thread and resumes it across messages and a restart', async t => {
@@ -448,7 +451,7 @@ test('external and unidentified senders run isolated even when the message claim
   const sentReply = p.event('reply_sent');
   p.delivery.enqueue('external', '企微单聊 · 本人', 'group', route);
   await sentReply;
-  assert.deepEqual(sent, [[route, 'done']]);
+  assert.deepEqual(sent, [[route, '任务已投递，完成后会在这里回复。'], [route, 'done']]);
   const complete = p.event('delivery_completed');
   p.delivery.enqueue('unidentified', 'owner', 'single', undefined, undefined, null);
   await complete;

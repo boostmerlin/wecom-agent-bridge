@@ -83,7 +83,7 @@ test('another backend handles WeCom commands, new turns and replies across a res
     const signal = AbortSignal.timeout(4000);
     const done = new Promise((resolve, reject) => {
       function listen(origin, answer) {
-        if (origin.chatId !== route.chatId || !matches(answer)) return;
+        if (origin.chatId !== route.chatId || answer.startsWith('已投递到 ') || !matches(answer)) return;
         replies.off('sent', listen);
         resolve([origin, answer]);
       }
@@ -114,6 +114,9 @@ test('another backend handles WeCom commands, new turns and replies across a res
   assert.match(calls[1].prompt, /企微群聊/);
   const before = calls.length;
   const help = await send('/help', true);
+  const helpParagraphs = help.split('\n\n');
+  assert.ok(helpParagraphs.includes('/help  查看帮助'));
+  assert.ok(helpParagraphs.every(line => !line.includes('\n')));
   for (const name of ['/status', '/tasks', '/bind', '/retry', '/threads', '/memory', '/forget']) assert.ok(help.includes(name));
   assert.ok(!help.includes('/save'));
   const groupStatus = await send('/status', true);

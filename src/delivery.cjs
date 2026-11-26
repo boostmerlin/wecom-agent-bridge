@@ -258,15 +258,15 @@ function createDelivery({
           else if (result.state === "rejected") replies.unmatched(message.id, result.reason || "delivery_rejected",
             rejectionNotices[result.reason] || "本次消息投递失败，处理程序未接受任务。请检查桥接日志，修复后由本人发送 /retry 重试。");
           else replies.unmatched(message.id, result.reason);
+          if (result.state === "accepted" && result.queueId) replies.trackProgress(message.id, false);
         }
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
         throw error;
       }
-      if (result.state === "accepted" && result.queueId) replies?.trackProgress(message.id, false);
-      else if (result.state === "queued") replies?.trackProgress(message.id, false, true);
-      else replies?.finishProgress(message.id);
+      if (result.state === "queued") replies?.trackProgress(message.id, false, true);
+      else if (result.state !== "accepted" || !result.queueId) replies?.finishProgress(message.id);
       if (result.state === "queued") {
         emit("delivery_deferred", { entry: message.id, reason: result.reason });
         retryLater();
